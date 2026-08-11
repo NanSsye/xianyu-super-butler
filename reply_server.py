@@ -2794,6 +2794,12 @@ def clear_default_reply_records(cid: str, current_user: Dict[str, Any] = Depends
 # ------------------------- 默认回复管理接口（单数形式兼容路由） -------------------------
 # 兼容前端使用 /api/default-reply/ 的请求
 
+@app.get('/api/default-replies')
+def get_all_default_replies_compat(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """获取当前用户全部默认回复设置（兼容前端路由）。"""
+    return get_all_default_replies(current_user)
+
+
 @app.get('/api/default-reply/{cid}')
 def get_default_reply_compat(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取指定账号的默认回复设置（兼容路由）"""
@@ -4559,8 +4565,72 @@ def get_item_detail(cookie_id: str, item_id: str, current_user: Dict[str, Any] =
         raise HTTPException(status_code=500, detail=f"获取商品详情失败: {str(e)}")
 
 
+@app.get("/items/{cookie_id}/{item_id}/skus")
+def get_item_skus(cookie_id: str, item_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """读取最近一次同步的闲鱼商品 SKU 快照。"""
+    try:
+        user_cookies = db_manager.get_all_cookies(current_user['user_id'])
+        if cookie_id not in user_cookies:
+            raise HTTPException(status_code=403, detail="无权限访问该Cookie")
+        if not db_manager.get_item_info(cookie_id, item_id):
+            raise HTTPException(status_code=404, detail="商品不存在")
+        return {"success": True, "skus": db_manager.get_item_skus(cookie_id, item_id)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取商品规格失败: {str(e)}")
+
+
+@app.post("/items/{cookie_id}/{item_id}/sync-skus")
+async def sync_item_skus(cookie_id: str, item_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """从闲鱼真实商品详情接口同步多维 SKU、价格和库存。"""
+    try:
+        user_cookies = db_manager.get_all_cookies(current_user['user_id'])
+        if cookie_id not in user_cookies:
+            raise HTTPException(status_code=403, detail="无权限操作该Cookie")
+        if not db_manager.get_item_info(cookie_id, item_id):
+            raise HTTPException(status_code=404, detail="商品不存在")
+
+        from utils.item_sku_fetcher import fetch_item_skus
+        skus = await fetch_item_skus(user_cookies[cookie_id], item_id)
+        if not skus:
+            raise HTTPException(status_code=422, detail="闲鱼商品未返回可用规格")
+        if not db_manager.replace_item_skus(cookie_id, item_id, skus):
+            raise HTTPException(status_code=500, detail="商品规格保存失败")
+        return {
+            "success": True,
+            "message": f"已同步 {len(skus)} 个规格组合",
+            "skus": db_manager.get_item_skus(cookie_id, item_id),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"同步商品规格失败: {cookie_id}/{item_id} - {e}")
+        raise HTTPException(status_code=500, detail=f"同步商品规格失败: {str(e)}")
+
+
 class ItemDetailUpdate(BaseModel):
-    item_detail: str
+    item_detail: Optional[str] = None
+    item_title: Optional[str] = None
+    item_description: Optional[str] = None
+    item_category: Optional[str] = None
+    item_price: Optional[str] = None
+    item_image: Optional[str] = None
+    is_multi_spec: Optional[bool] = None
+    is_multi_qty_ship: Optional[bool] = None
+    multi_quantity_delivery: Optional[bool] = None
+
+
+class ItemCreate(BaseModel):
+    item_id: str
+    item_title: Optional[str] = None
+    item_description: Optional[str] = None
+    item_category: Optional[str] = None
+    item_price: Optional[str] = None
+    item_image: Optional[str] = None
+    is_multi_spec: Optional[bool] = None
+    is_multi_qty_ship: Optional[bool] = None
+    multi_quantity_delivery: Optional[bool] = None
 
 
 @app.put("/items/{cookie_id}/{item_id}")
@@ -4580,9 +4650,46 @@ def update_item_detail(
         if cookie_id not in user_cookies:
             raise HTTPException(status_code=403, detail="无权限操作该Cookie")
 
-        success = db_manager.update_item_detail(cookie_id, item_id, update_data.item_detail)
+        supplied_values = update_data.dict(exclude_unset=True)
+        if not supplied_values:
+            raise HTTPException(status_code=400, detail="没有可更新的商品字段")
+
+        if update_data.item_detail is not None and update_data.item_image is not None:
+            try:
+                parsed_detail = json.loads(update_data.item_detail)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="同时更新图片时，商品详情必须是有效 JSON")
+            if not isinstance(parsed_detail, dict):
+                raise HTTPException(status_code=400, detail="同时更新图片时，商品详情必须是 JSON 对象")
+
+        success = True
+        if update_data.item_detail is not None:
+            success = db_manager.update_item_detail(cookie_id, item_id, update_data.item_detail)
+
+        editable_fields = {
+            'item_title', 'item_description', 'item_category', 'item_price',
+            'item_image', 'is_multi_spec', 'is_multi_qty_ship',
+            'multi_quantity_delivery'
+        }
+        if editable_fields.intersection(supplied_values):
+            multi_quantity_delivery = update_data.multi_quantity_delivery
+            if multi_quantity_delivery is None:
+                multi_quantity_delivery = update_data.is_multi_qty_ship
+
+            success = success and db_manager.upsert_item_info(
+                cookie_id=cookie_id,
+                item_id=item_id,
+                item_title=update_data.item_title,
+                item_description=update_data.item_description,
+                item_category=update_data.item_category,
+                item_price=update_data.item_price,
+                item_image=update_data.item_image,
+                is_multi_spec=update_data.is_multi_spec,
+                multi_quantity_delivery=multi_quantity_delivery,
+            )
+
         if success:
-            return {"message": "商品详情更新成功"}
+            return {"success": True, "message": "商品信息更新成功"}
         else:
             raise HTTPException(status_code=400, detail="更新失败")
     except HTTPException:
@@ -5007,6 +5114,48 @@ async def get_items_by_page(request: dict, _: None = Depends(require_auth)):
     except Exception as e:
         logger.error(f"获取账号商品信息异常: {str(e)}")
         return {"success": False, "message": f"获取商品信息异常: {str(e)}"}
+
+
+@app.post("/items/{cookie_id}")
+def create_item_info(
+    cookie_id: str,
+    item_data: ItemCreate,
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """为当前用户的指定账号新增或补全本地商品信息。"""
+    try:
+        user_cookies = db_manager.get_all_cookies(current_user['user_id'])
+        if cookie_id not in user_cookies:
+            raise HTTPException(status_code=403, detail="无权限操作该Cookie")
+
+        item_id = item_data.item_id.strip()
+        if not item_id:
+            raise HTTPException(status_code=400, detail="商品ID不能为空")
+
+        multi_quantity_delivery = item_data.multi_quantity_delivery
+        if multi_quantity_delivery is None:
+            multi_quantity_delivery = item_data.is_multi_qty_ship
+
+        success = db_manager.upsert_item_info(
+            cookie_id=cookie_id,
+            item_id=item_id,
+            item_title=item_data.item_title,
+            item_description=item_data.item_description,
+            item_category=item_data.item_category,
+            item_price=item_data.item_price,
+            item_image=item_data.item_image,
+            is_multi_spec=item_data.is_multi_spec,
+            multi_quantity_delivery=multi_quantity_delivery,
+        )
+        if not success:
+            raise HTTPException(status_code=400, detail="新增商品失败")
+
+        return {"success": True, "message": "商品新增成功", "item_id": item_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"新增商品信息异常: {e}")
+        raise HTTPException(status_code=500, detail=f"新增商品失败: {str(e)}")
 
 
 # ------------------------- 用户设置接口 -------------------------
@@ -5981,40 +6130,62 @@ def clear_table_data(table_name: str, admin_user: Dict[str, Any] = Depends(requi
 
 # 商品多规格管理API
 @app.put("/items/{cookie_id}/{item_id}/multi-spec")
-def update_item_multi_spec(cookie_id: str, item_id: str, spec_data: dict, _: None = Depends(require_auth)):
+def update_item_multi_spec(
+    cookie_id: str,
+    item_id: str,
+    spec_data: dict,
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
     """更新商品的多规格状态"""
     try:
         from db_manager import db_manager
+
+        user_cookies = db_manager.get_all_cookies(current_user['user_id'])
+        if cookie_id not in user_cookies:
+            raise HTTPException(status_code=403, detail="无权限操作该Cookie")
 
         is_multi_spec = spec_data.get('is_multi_spec', False)
 
         success = db_manager.update_item_multi_spec_status(cookie_id, item_id, is_multi_spec)
 
         if success:
-            return {"message": f"商品多规格状态已{'开启' if is_multi_spec else '关闭'}"}
+            return {"success": True, "message": f"商品多规格状态已{'开启' if is_multi_spec else '关闭'}"}
         else:
             raise HTTPException(status_code=404, detail="商品不存在")
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 # 商品多数量发货管理API
 @app.put("/items/{cookie_id}/{item_id}/multi-quantity-delivery")
-def update_item_multi_quantity_delivery(cookie_id: str, item_id: str, delivery_data: dict, _: None = Depends(require_auth)):
+def update_item_multi_quantity_delivery(
+    cookie_id: str,
+    item_id: str,
+    delivery_data: dict,
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
     """更新商品的多数量发货状态"""
     try:
         from db_manager import db_manager
+
+        user_cookies = db_manager.get_all_cookies(current_user['user_id'])
+        if cookie_id not in user_cookies:
+            raise HTTPException(status_code=403, detail="无权限操作该Cookie")
 
         multi_quantity_delivery = delivery_data.get('multi_quantity_delivery', False)
 
         success = db_manager.update_item_multi_quantity_delivery_status(cookie_id, item_id, multi_quantity_delivery)
 
         if success:
-            return {"message": f"商品多数量发货状态已{'开启' if multi_quantity_delivery else '关闭'}"}
+            return {"success": True, "message": f"商品多数量发货状态已{'开启' if multi_quantity_delivery else '关闭'}"}
         else:
             raise HTTPException(status_code=404, detail="商品不存在")
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -7003,92 +7174,36 @@ async def manual_ship_orders(
                         failed_count += 1
                         continue
 
-                    # 检查多数量发货
-                    quantity_to_send = 1
-                    multi_quantity_delivery = db_manager.get_item_multi_quantity_delivery_status(cookie_id, item_id)
-                    if multi_quantity_delivery:
-                        try:
-                            order_detail = await live_instance.fetch_order_detail_info(order_id, item_id, buyer_id)
-                            if order_detail and isinstance(order_detail, dict):
-                                qty = order_detail.get('quantity', 1)
-                                if isinstance(qty, int) and qty > 1:
-                                    quantity_to_send = qty
-                        except Exception as e:
-                            log_with_user('warning', f"获取订单数量失败，使用默认数量1: {str(e)}", current_user)
-
-                    # 调用_auto_delivery获取卡券内容（内部会调用auto_confirm）
-                    delivery_contents = []
-                    for i in range(quantity_to_send):
-                        try:
-                            delivery_content = await live_instance._auto_delivery(
-                                item_id, '', order_id, buyer_id
-                            )
-                            if delivery_content:
-                                delivery_contents.append(delivery_content)
-                        except Exception as e:
-                            log_with_user('error', f"获取第{i+1}个卡券失败: {str(e)}", current_user)
-
-                    if not delivery_contents:
-                        results.append({
-                            'order_id': order_id,
-                            'success': False,
-                            'message': '未匹配到发货规则或卡券获取失败'
-                        })
-                        failed_count += 1
-                        continue
-
-                    # 发送卡券内容给买家
-                    send_success = True
-                    for idx, content in enumerate(delivery_contents):
-                        try:
-                            if content.startswith("__IMAGE_SEND__"):
-                                image_data = content.replace("__IMAGE_SEND__", "")
-                                card_id = None
-                                if "|" in image_data:
-                                    card_id_str, image_url = image_data.split("|", 1)
-                                    try:
-                                        card_id = int(card_id_str)
-                                    except ValueError:
-                                        card_id = None
-                                else:
-                                    image_url = image_data
-                                await live_instance.send_image_msg(
-                                    live_instance.ws, chat_id, buyer_id,
-                                    image_url, card_id=card_id
-                                )
-                            else:
-                                await live_instance.send_msg(
-                                    live_instance.ws, chat_id, buyer_id, content
-                                )
-
-                            # 多条消息之间间隔1秒
-                            if len(delivery_contents) > 1 and idx < len(delivery_contents) - 1:
-                                await asyncio.sleep(1)
-                        except Exception as e:
-                            log_with_user('error', f"发送第{idx+1}条卡券消息失败: {str(e)}", current_user)
-                            send_success = False
-
-                    # 更新本地数据库状态
-                    db_manager.insert_or_update_order(
-                        order_id=order_id,
-                        order_status='shipped',
-                        system_shipped=True
+                    # 手动完整发货必须复用自动发货的唯一安全链路：
+                    # 生成并保存兑换码 -> 发送消息 -> 确认闲鱼发货 -> 标记本地已发货。
+                    synthetic_message = {
+                        'targetUrl': f'fleamarket://order_detail?id={order_id}&role=seller'
+                    }
+                    await live_instance._handle_auto_delivery(
+                        live_instance.ws,
+                        synthetic_message,
+                        '买家',
+                        buyer_id,
+                        item_id,
+                        chat_id,
+                        time.strftime('%Y-%m-%d %H:%M:%S'),
                     )
 
-                    if send_success:
+                    updated_order = db_manager.get_order_by_id(order_id) or {}
+                    if updated_order.get('system_shipped'):
                         results.append({
                             'order_id': order_id,
                             'success': True,
-                            'message': f'完整发货成功，已发送{len(delivery_contents)}条卡券信息给买家'
+                            'message': '完整发货成功，兑换码已发送并完成持久化'
                         })
                         success_count += 1
                     else:
                         results.append({
                             'order_id': order_id,
-                            'success': True,
-                            'message': f'发货状态已更新，但部分卡券消息发送失败（共{len(delivery_contents)}条）'
+                            'success': False,
+                            'message': '完整发货未完成，订单保持未发货，请查看服务端审计日志'
                         })
-                        success_count += 1
+                        failed_count += 1
 
             except Exception as e:
                 results.append({

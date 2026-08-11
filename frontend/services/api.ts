@@ -2,7 +2,7 @@ import { get, post, put, del } from '../request';
 import {
   LoginResponse, AccountDetail, Order, PaginatedResponse,
   AdminStats, Card, SystemSettings, ApiResponse, OrderAnalytics,
-  Item, AIReplySettings, ShippingRule, ReplyRule, DefaultReply
+  Item, ItemSku, AIReplySettings, ShippingRule, ReplyRule, DefaultReply
 } from '../types';
 
 // Auth
@@ -242,6 +242,23 @@ export const updateItem = async (cookieId: string, itemId: string, data: any): P
     return put(`/items/${cookieId}/${itemId}`, data);
 }
 
+export const updateItemMultiSpec = async (cookieId: string, itemId: string, enabled: boolean): Promise<any> => {
+    return put(`/items/${cookieId}/${itemId}/multi-spec`, { is_multi_spec: enabled });
+}
+
+export const updateItemMultiQuantityDelivery = async (cookieId: string, itemId: string, enabled: boolean): Promise<any> => {
+    return put(`/items/${cookieId}/${itemId}/multi-quantity-delivery`, { multi_quantity_delivery: enabled });
+}
+
+export const getItemSkus = async (cookieId: string, itemId: string): Promise<ItemSku[]> => {
+    const res = await get<{ skus?: ItemSku[] }>(`/items/${cookieId}/${itemId}/skus`);
+    return res.skus || [];
+}
+
+export const syncItemSkus = async (cookieId: string, itemId: string): Promise<{ success: boolean; message?: string; skus?: ItemSku[] }> => {
+    return post(`/items/${cookieId}/${itemId}/sync-skus`, {});
+}
+
 // Rules - 发货规则 (使用正确的后端API)
 export const getShippingRules = async (): Promise<ShippingRule[]> => {
     const res = await get<any>('/delivery-rules');
@@ -253,6 +270,10 @@ export const getShippingRules = async (): Promise<ShippingRule[]> => {
         item_keyword: item.keyword || '',
         card_group_id: item.card_id || 0,
         card_group_name: item.card_name || '',
+        card_type: item.card_type || '',
+        is_multi_spec: Boolean(item.is_multi_spec),
+        spec_name: item.spec_name || '',
+        spec_value: item.spec_value || '',
         priority: item.delivery_count || 1,
         enabled: item.enabled || false
     }));

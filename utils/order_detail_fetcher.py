@@ -116,7 +116,6 @@ class OrderDetailFetcher:
                     '--disable-popup-blocking',
                     '--disable-prompt-on-repost',
                     '--disable-sync',
-                    '--disable-web-resources',
                     '--metrics-recording-only',
                     '--no-first-run',
                     '--safebrowsing-disable-auto-update',
@@ -150,10 +149,13 @@ class OrderDetailFetcher:
                 user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36'
             )
 
-            logger.info("浏览器上下文创建成功，设置HTTP头...")
+            logger.info("浏览器上下文创建成功，设置语言头...")
 
-            # 设置额外的HTTP头
-            await self.context.set_extra_http_headers(self.headers)
+            # Chromium 会自行生成 sec-fetch/sec-ch-ua 等导航头。把这些头强制
+            # 应用到 CSS/JS 子资源会触发 net::ERR_INVALID_ARGUMENT，导致页面空白。
+            await self.context.set_extra_http_headers({
+                "accept-language": "zh-CN,zh;q=0.9,en;q=0.8"
+            })
 
             logger.info("创建页面...")
 

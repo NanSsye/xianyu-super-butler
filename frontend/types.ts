@@ -122,6 +122,16 @@ export interface Item {
   created_at?: string;
 }
 
+export interface ItemSku {
+  sku_id: string;
+  properties: Array<{ name: string; value: string }>;
+  display_name: string;
+  price_cent?: number | null;
+  price?: number | null;
+  quantity?: number | null;
+  updated_at?: string;
+}
+
 // Rules
 export interface ShippingRule {
   id: string;
@@ -129,6 +139,10 @@ export interface ShippingRule {
   item_keyword: string; // Matches item title
   card_group_id: number; // ID from Card list
   card_group_name?: string; // UI helper
+  card_type?: string;
+  is_multi_spec?: boolean;
+  spec_name?: string;
+  spec_value?: string;
   priority: number;
   enabled: boolean;
 }

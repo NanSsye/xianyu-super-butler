@@ -1100,6 +1100,75 @@ class XianyuLive:
             logger.error(f"【{self.cookie_id}】提取订单ID失败: {self._safe_str(e)}")
             return None
 
+    def _is_paid_order_update_event(self, message: dict) -> bool:
+        """识别闲鱼付款后以增量更新形式推送的“已付款，待发货”事件。"""
+        if not isinstance(message, dict):
+            return False
+
+        reminder = message.get('3')
+        if isinstance(reminder, dict) and reminder.get('redReminder') == '等待卖家发货':
+            return True
+
+        update = message.get('4')
+        if not isinstance(update, dict):
+            return False
+        paid_texts = (
+            update.get('reminderContent'),
+            update.get('redReminder'),
+            update.get('_CONTENT_MAP_UPDATE_PRE_dxCard.item.main.exContent.button'),
+        )
+        return any(
+            isinstance(value, str) and ('已付款' in value or '等待卖家发货' in value)
+            for value in paid_texts
+        )
+
+    async def _handle_paid_order_update(self, websocket, message: dict, order_id: str,
+                                        msg_time: str) -> bool:
+        """等待订单详情完成后，把付款增量事件接入统一自动发货链路。"""
+        try:
+            order_lock = self._order_detail_locks[order_id]
+            if order_lock.locked():
+                logger.info(f"付款事件等待订单详情完成: order_id={order_id}")
+                async with order_lock:
+                    pass
+
+            order = db_manager.get_order_by_id(order_id) or {}
+            update = message.get('4') if isinstance(message.get('4'), dict) else {}
+            reminder_url = update.get('reminderUrl', '') if isinstance(update, dict) else ''
+
+            item_id = order.get('item_id')
+            if not item_id and 'itemId=' in reminder_url:
+                item_id = reminder_url.split('itemId=', 1)[1].split('&', 1)[0]
+
+            buyer_id = order.get('buyer_id') or update.get('senderUserId')
+            if not buyer_id and 'peerUserId=' in reminder_url:
+                buyer_id = reminder_url.split('peerUserId=', 1)[1].split('&', 1)[0]
+
+            chat_id_raw = order.get('chat_id') or message.get('2') or ''
+            chat_id = str(chat_id_raw).split('@', 1)[0]
+
+            if not item_id or not buyer_id or not chat_id:
+                logger.error(
+                    f"付款事件缺少自动发货上下文: order_id={order_id}, "
+                    f"item={bool(item_id)}, buyer={bool(buyer_id)}, chat={bool(chat_id)}"
+                )
+                return False
+
+            logger.info(f"付款事件已接入自动发货: order_id={order_id}, item_id={item_id}")
+            await self._handle_auto_delivery(
+                websocket,
+                message,
+                '买家',
+                str(buyer_id),
+                str(item_id),
+                chat_id,
+                msg_time,
+            )
+            return True
+        except Exception as exc:
+            logger.error(f"处理付款增量事件失败: order_id={order_id}, error={self._safe_str(exc)}")
+            return False
+
     async def _handle_auto_delivery(self, websocket, message: dict, send_user_name: str, send_user_id: str,
                                    item_id: str, chat_id: str, msg_time: str):
         """统一处理自动发货逻辑"""
@@ -1221,35 +1290,8 @@ class XianyuLive:
                             logger.error(f"第 {i+1}/{quantity_to_send} 个卡券获取异常: {self._safe_str(e)}")
 
                     if delivery_contents:
-                        # 标记已发货（防重复）- 基于订单ID
-                        self.mark_delivery_sent(order_id)
-
-                        # 更新订单数据库，标记系统已发货
-                        if order_id:
-                            try:
-                                from db_manager import db_manager
-                                db_manager.insert_or_update_order(
-                                    order_id=order_id,
-                                    system_shipped=True,
-                                    chat_id=chat_id
-                                )
-                                logger.info(f'【{self.cookie_id}】✅ 订单 {order_id} 已标记为系统已发货 (system_shipped=1)')
-                            except Exception as db_e:
-                                logger.error(f'【{self.cookie_id}】❌ 更新订单system_shipped状态失败: {self._safe_str(db_e)}')
-
-                        # 标记锁为持有状态，并启动延迟释放任务
-                        self._lock_hold_info[lock_key] = {
-                            'locked': True,
-                            'lock_time': time.time(),
-                            'release_time': None,
-                            'task': None
-                        }
-
-                        # 启动延迟释放锁的异步任务（10分钟后释放）
-                        delay_task = asyncio.create_task(self._delayed_lock_release(lock_key, delay_minutes=10))
-                        self._lock_hold_info[lock_key]['task'] = delay_task
-
-                        # 发送所有获取到的发货内容
+                        # 先发送内容；发送失败时绝不能标记订单已发货。
+                        all_messages_sent = True
                         for i, delivery_content in enumerate(delivery_contents):
                             try:
                                 # 检查是否是图片发送标记
@@ -1292,13 +1334,70 @@ class XianyuLive:
                                         await asyncio.sleep(1)
 
                             except Exception as e:
+                                all_messages_sent = False
                                 logger.error(f"发送第 {i+1} 条消息失败: {self._safe_str(e)}")
 
-                        # 发送成功通知
-                        if len(delivery_contents) > 1:
-                            await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, f"多数量发货成功，共发送 {len(delivery_contents)} 个卡券", chat_id)
+                        redemption_sku = getattr(self, '_pending_redemption_deliveries', {}).get(order_id)
+                        audit_saved = True
+                        if all_messages_sent and redemption_sku:
+                            audit_saved = db_manager.mark_redemption_delivered(order_id, redemption_sku)
+                            if not audit_saved:
+                                logger.error(f"微伴兑换码交付审计更新失败: order_id={order_id}, sku={redemption_sku}")
+
+                        platform_confirmed = True
+                        if all_messages_sent and audit_saved and order_id and self.is_auto_confirm_enabled():
+                            current_time = time.time()
+                            already_confirmed = (
+                                order_id in self.confirmed_orders and
+                                current_time - self.confirmed_orders[order_id] < self.order_confirm_cooldown
+                            )
+                            if not already_confirmed:
+                                logger.info(f"发货内容已发送，开始确认闲鱼发货: order_id={order_id}")
+                                confirm_result = await self.auto_confirm(order_id, item_id)
+                                platform_confirmed = bool(confirm_result.get('success'))
+                                if platform_confirmed:
+                                    self.confirmed_orders[order_id] = current_time
+                                else:
+                                    logger.error(
+                                        f"闲鱼确认发货失败，订单保持未发货: order_id={order_id}, "
+                                        f"error={confirm_result.get('error', 'unknown')}"
+                                    )
+
+                        delivery_finalized = all_messages_sent and audit_saved and platform_confirmed
+                        if delivery_finalized and order_id:
+                            saved = db_manager.insert_or_update_order(
+                                order_id=order_id,
+                                system_shipped=True,
+                                chat_id=chat_id,
+                            )
+                            delivery_finalized = bool(saved)
+
+                        if delivery_finalized:
+                            self.mark_delivery_sent(order_id)
+                            if redemption_sku:
+                                self._pending_redemption_deliveries.pop(order_id, None)
+                            logger.info(f'【{self.cookie_id}】订单 {order_id} 已完成发货并持久化')
+
+                            self._lock_hold_info[lock_key] = {
+                                'locked': True,
+                                'lock_time': time.time(),
+                                'release_time': None,
+                                'task': None
+                            }
+                            delay_task = asyncio.create_task(self._delayed_lock_release(lock_key, delay_minutes=10))
+                            self._lock_hold_info[lock_key]['task'] = delay_task
+
+                            if len(delivery_contents) > 1:
+                                await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, f"多数量发货成功，共发送 {len(delivery_contents)} 个卡券", chat_id)
+                            else:
+                                await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, "发货成功", chat_id)
                         else:
-                            await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, "发货成功", chat_id)
+                            logger.error(f"订单发货未完成，保持未发货状态: order_id={order_id}")
+                            await self.send_delivery_failure_notification(
+                                send_user_name, send_user_id, item_id,
+                                "发货内容生成、发送、审计或闲鱼确认失败，订单未标记为已发货",
+                                chat_id,
+                            )
                     else:
                         logger.warning(f'[{msg_time}] 【自动发货】未找到匹配的发货规则或获取发货内容失败')
                         # 发送自动发货失败通知
@@ -4722,32 +4821,6 @@ class XianyuLive:
                 await asyncio.sleep(delay_seconds)
                 logger.info(f"延时完成")
 
-            # 如果有订单ID，执行确认发货
-            if order_id:
-                # 检查是否启用自动确认发货
-                if not self.is_auto_confirm_enabled():
-                    logger.info(f"自动确认发货已关闭，跳过订单 {order_id}")
-                else:
-                    # 检查确认发货冷却时间
-                    current_time = time.time()
-                    should_confirm = True
-
-                    if order_id in self.confirmed_orders:
-                        last_confirm_time = self.confirmed_orders[order_id]
-                        if current_time - last_confirm_time < self.order_confirm_cooldown:
-                            logger.info(f"订单 {order_id} 已在 {self.order_confirm_cooldown} 秒内确认过，跳过重复确认")
-                            should_confirm = False
-
-                    if should_confirm:
-                        logger.info(f"开始自动确认发货: 订单ID={order_id}, 商品ID={item_id}")
-                        confirm_result = await self.auto_confirm(order_id, item_id)
-                        if confirm_result.get('success'):
-                            self.confirmed_orders[order_id] = current_time
-                            logger.info(f"🎉 自动确认发货成功！订单ID: {order_id}")
-                        else:
-                            logger.warning(f"⚠️ 自动确认发货失败: {confirm_result.get('error', '未知错误')}")
-                            # 即使确认发货失败，也继续发送发货内容
-
             # 检查是否存在订单ID，只有存在订单ID才处理发货内容
             if order_id:
                 # 保存订单基本信息到数据库（如果还没有详细信息）
@@ -4883,6 +4956,12 @@ class XianyuLive:
             if isinstance(api_config, str):
                 api_config = json.loads(api_config)
 
+            # 微伴兑换码必须使用服务端环境变量鉴权，并走专用的幂等、审计和重试流程。
+            if api_config.get('provider') == 'weiban_redemption':
+                return await self._get_weiban_redemption_content(
+                    api_config, order_id, spec_name, spec_value
+                )
+
             url = api_config.get('url')
             method = api_config.get('method', 'GET').upper()
             timeout = api_config.get('timeout', 10)
@@ -4966,6 +5045,58 @@ class XianyuLive:
         except Exception as e:
             logger.error(f"API调用异常: {self._safe_str(e)}")
             return None
+
+    async def _get_weiban_redemption_content(self, api_config, order_id, spec_name, spec_value):
+        """生成并持久化微伴兑换码；任何不确定状态都停止自动发货。"""
+        from utils.weiban_redemption import WeibanRedemptionClient, VALID_SKUS
+
+        sku = str(api_config.get('sku') or '').strip()
+        if sku not in VALID_SKUS or not order_id:
+            logger.error(f"微伴兑换码配置无效: sku={sku or 'missing'}, has_order_id={bool(order_id)}")
+            return None
+
+        order = db_manager.get_order_by_id(order_id)
+        quantity_raw = (order or {}).get('quantity')
+        try:
+            quantity = int(quantity_raw or 1)
+        except (TypeError, ValueError):
+            quantity = 0
+        if quantity != 1:
+            db_manager.add_redemption_request_audit(
+                order_id=order_id,
+                sku=sku,
+                response_status=422,
+                outcome='quantity_not_supported',
+                error_detail='redemption API supports one code per order',
+                attempt_no=0,
+            )
+            logger.error(f"微伴兑换码停止发货: order_id={order_id}, quantity={quantity}")
+            return None
+
+        note_value = f"闲鱼自动发货：{spec_value or spec_name or sku}"[:255]
+        result = await WeibanRedemptionClient(db_manager).create_code(
+            sku=sku,
+            order_id=order_id,
+            note=note_value,
+        )
+        if not result.get('success'):
+            logger.error(
+                f"微伴兑换码获取失败: order_id={order_id}, sku={sku}, "
+                f"error={result.get('error_code', 'unknown')}"
+            )
+            return None
+
+        if not hasattr(self, '_pending_redemption_deliveries'):
+            self._pending_redemption_deliveries = {}
+        self._pending_redemption_deliveries[order_id] = sku
+
+        plan_code, duration_code = sku.split('_', 1)
+        duration_label = {
+            'month': '月卡',
+            'quarter': '季卡',
+            'year': '年卡',
+        }[duration_code]
+        return f"您购买的是：{plan_code.title()} {duration_label}\n兑换码：{result['code']}"
 
     async def _replace_api_dynamic_params(self, params, order_id=None, item_id=None, buyer_id=None, spec_name=None, spec_value=None):
         """替换API请求参数中的动态参数"""
@@ -7579,6 +7710,12 @@ class XianyuLive:
                     logger.warning(f"【{self.cookie_id}】未检测到订单ID")
             except Exception as e:
                 logger.error(f"【{self.cookie_id}】提取订单ID失败: {self._safe_str(e)}")
+
+            # 付款后的状态更新不是普通聊天消息，必须在聊天消息判断之前接入自动发货。
+            if order_id and self._is_paid_order_update_event(message):
+                paid_msg_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+                if await self._handle_paid_order_update(websocket, message, order_id, paid_msg_time):
+                    return
 
             # 安全地获取用户ID
             user_id = None

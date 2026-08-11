@@ -230,10 +230,42 @@ class DBManager:
                 order_status TEXT DEFAULT 'unknown',
                 cookie_id TEXT,
                 is_bargain INTEGER DEFAULT 0,
+                system_shipped INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE
             )
+            ''')
+
+            # 微伴兑换码发货记录：完整兑换码仅保存在服务端数据库中，order_id 全局幂等。
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS redemption_deliveries (
+                order_id TEXT PRIMARY KEY,
+                sku TEXT NOT NULL,
+                code TEXT NOT NULL,
+                code_masked TEXT NOT NULL,
+                response_status INTEGER NOT NULL,
+                delivered_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            ''')
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS redemption_request_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id TEXT NOT NULL,
+                sku TEXT NOT NULL,
+                requested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                response_status INTEGER,
+                outcome TEXT NOT NULL,
+                masked_code TEXT DEFAULT '',
+                error_detail TEXT DEFAULT '',
+                attempt_no INTEGER NOT NULL DEFAULT 0
+            )
+            ''')
+            cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_redemption_audit_order
+            ON redemption_request_audit(order_id, requested_at)
             ''')
 
             # 检查并添加 is_bargain 列（用于标记小刀订单）
@@ -266,6 +298,14 @@ class DBManager:
 
             except Exception as e:
                 logger.error(f"检查/补齐 orders 收货信息列失败: {e}")
+
+            # 检查并添加 system_shipped 列（用于记录系统是否已完成发货）
+            try:
+                self._execute_sql(cursor, "SELECT system_shipped FROM orders LIMIT 1")
+            except sqlite3.OperationalError:
+                logger.info("正在为 orders 表添加 system_shipped 列...")
+                self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN system_shipped INTEGER DEFAULT 0")
+                logger.info("orders 表 system_shipped 列添加完成")
 
             # 检查并添加 version 列（用于乐观锁）
             try:
@@ -331,6 +371,29 @@ class DBManager:
             )
             ''')
 
+            # 闲鱼商品的真实 SKU 快照。properties_json 保留多维规格组合，
+            # 避免把 Lite/Pro 之类的多规格压扁成单一名称和值。
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS item_skus (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cookie_id TEXT NOT NULL,
+                item_id TEXT NOT NULL,
+                sku_id TEXT NOT NULL,
+                properties_json TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                price_cent INTEGER,
+                quantity INTEGER,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (cookie_id, item_id)
+                    REFERENCES item_info(cookie_id, item_id) ON DELETE CASCADE,
+                UNIQUE(cookie_id, item_id, sku_id)
+            )
+            ''')
+            cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_item_skus_item
+            ON item_skus(cookie_id, item_id)
+            ''')
+
             # 检查并添加 multi_quantity_delivery 列（用于多数量发货功能）
             try:
                 self._execute_sql(cursor, "SELECT multi_quantity_delivery FROM item_info LIMIT 1")
@@ -346,6 +409,7 @@ class DBManager:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 keyword TEXT NOT NULL,
                 card_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL DEFAULT 1,
                 delivery_count INTEGER DEFAULT 1,
                 enabled BOOLEAN DEFAULT TRUE,
                 description TEXT,
@@ -537,6 +601,53 @@ class DBManager:
             # 检查并更新CHECK约束（重建表以支持image类型）
             self._update_cards_table_constraints(cursor)
 
+            # 补齐发货规则的用户归属，旧库中的规则优先继承关联卡券用户
+            cursor.execute("PRAGMA table_info(delivery_rules)")
+            delivery_rule_columns = [column[1] for column in cursor.fetchall()]
+            if 'user_id' not in delivery_rule_columns:
+                logger.info("正在为 delivery_rules 表添加 user_id 列...")
+                cursor.execute("ALTER TABLE delivery_rules ADD COLUMN user_id INTEGER")
+
+            # 已有列也可能包含未回填的 NULL（例如上次迁移中途退出），继续幂等修复
+            cursor.execute('''
+                UPDATE delivery_rules
+                SET user_id = (
+                    SELECT c.user_id
+                    FROM cards c
+                    WHERE c.id = delivery_rules.card_id
+                )
+                WHERE user_id IS NULL
+                  AND EXISTS (
+                    SELECT 1
+                    FROM cards c
+                    WHERE c.id = delivery_rules.card_id
+                      AND c.user_id IS NOT NULL
+                  )
+            ''')
+
+            cursor.execute("SELECT COUNT(*) FROM delivery_rules WHERE user_id IS NULL")
+            missing_delivery_rule_users = cursor.fetchone()[0]
+            if missing_delivery_rule_users:
+                cursor.execute("SELECT id FROM users WHERE username = 'admin' LIMIT 1")
+                admin_user = cursor.fetchone()
+                if not admin_user:
+                    raise RuntimeError(
+                        "delivery_rules.user_id 迁移失败：无法从 cards 推断用户，且 admin 用户不存在"
+                    )
+                cursor.execute(
+                    "UPDATE delivery_rules SET user_id = ? WHERE user_id IS NULL",
+                    (admin_user[0],)
+                )
+
+            cursor.execute("SELECT COUNT(*) FROM delivery_rules WHERE user_id IS NULL")
+            if cursor.fetchone()[0]:
+                raise RuntimeError("delivery_rules.user_id 迁移失败：仍存在未归属规则")
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_delivery_rules_user_id "
+                "ON delivery_rules(user_id)"
+            )
+            logger.info("delivery_rules 表 user_id 迁移完成")
+
             # 检查cookies表是否存在remark列
             cursor.execute("PRAGMA table_info(cookies)")
             cookie_columns = [column[1] for column in cursor.fetchall()]
@@ -568,8 +679,19 @@ class DBManager:
 
         except Exception as e:
             logger.error(f"数据库迁移失败: {e}")
-            # 迁移失败不应该阻止程序启动
-            pass
+            # 仅关键的发货规则归属迁移失败时阻止启动；保留其他旧迁移的兼容行为。
+            try:
+                cursor.execute("PRAGMA table_info(delivery_rules)")
+                delivery_rule_columns = [column[1] for column in cursor.fetchall()]
+                delivery_rules_incomplete = 'user_id' not in delivery_rule_columns
+                if not delivery_rules_incomplete:
+                    cursor.execute("SELECT COUNT(*) FROM delivery_rules WHERE user_id IS NULL")
+                    delivery_rules_incomplete = cursor.fetchone()[0] > 0
+            except Exception:
+                delivery_rules_incomplete = True
+
+            if delivery_rules_incomplete:
+                raise
 
     def _update_cards_table_constraints(self, cursor):
         """更新cards表的CHECK约束以支持image类型"""
@@ -3713,6 +3835,104 @@ class DBManager:
             self.conn.rollback()
             return False
 
+    def upsert_item_info(self, cookie_id: str, item_id: str, item_title: str = None,
+                         item_description: str = None, item_category: str = None,
+                         item_price: str = None, item_image: str = None,
+                         is_multi_spec: bool = None,
+                         multi_quantity_delivery: bool = None) -> bool:
+        """新增或更新商品记录，图片写入 item_detail.pic_info.picUrl。"""
+        if not cookie_id or not item_id:
+            return False
+
+        try:
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    SELECT item_detail
+                    FROM item_info
+                    WHERE cookie_id = ? AND item_id = ?
+                ''', (cookie_id, item_id))
+                existing = cursor.fetchone()
+
+                detail_update = None
+                if item_image is not None:
+                    normalized_image = item_image
+                    if isinstance(normalized_image, str) and normalized_image.startswith('//'):
+                        normalized_image = f'https:{normalized_image}'
+
+                    existing_detail = existing[0] if existing else ''
+                    parsed_detail = {}
+                    if existing_detail:
+                        try:
+                            parsed_detail = json.loads(existing_detail)
+                        except (TypeError, ValueError):
+                            logger.warning(
+                                f"商品详情不是有效 JSON，无法安全写入图片: {item_id}"
+                            )
+                            return False
+
+                    if isinstance(parsed_detail, dict):
+                        pic_info = parsed_detail.get('pic_info')
+                        if not isinstance(pic_info, dict):
+                            pic_info = {}
+                        pic_info['picUrl'] = normalized_image
+                        parsed_detail['pic_info'] = pic_info
+                        detail_update = json.dumps(parsed_detail, ensure_ascii=False)
+                    else:
+                        logger.warning(
+                            f"商品详情不是 JSON 对象，无法安全写入图片: {item_id}"
+                        )
+                        return False
+
+                if existing:
+                    update_parts = []
+                    params = []
+                    for column, value in (
+                        ('item_title', item_title),
+                        ('item_description', item_description),
+                        ('item_category', item_category),
+                        ('item_price', item_price),
+                        ('is_multi_spec', is_multi_spec),
+                        ('multi_quantity_delivery', multi_quantity_delivery),
+                    ):
+                        if value is not None:
+                            update_parts.append(f'{column} = ?')
+                            params.append(value)
+                    if detail_update is not None:
+                        update_parts.append('item_detail = ?')
+                        params.append(detail_update)
+
+                    if update_parts:
+                        update_parts.append('updated_at = CURRENT_TIMESTAMP')
+                        params.extend([cookie_id, item_id])
+                        cursor.execute(
+                            f"UPDATE item_info SET {', '.join(update_parts)} "
+                            "WHERE cookie_id = ? AND item_id = ?",
+                            params
+                        )
+                else:
+                    detail_value = detail_update or ''
+                    cursor.execute('''
+                        INSERT INTO item_info (
+                            cookie_id, item_id, item_title, item_description,
+                            item_category, item_price, item_detail,
+                            is_multi_spec, multi_quantity_delivery,
+                            created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    ''', (
+                        cookie_id, item_id, item_title or '', item_description or '',
+                        item_category or '', item_price or '', detail_value,
+                        bool(is_multi_spec) if is_multi_spec is not None else False,
+                        bool(multi_quantity_delivery) if multi_quantity_delivery is not None else False,
+                    ))
+
+                self.conn.commit()
+                return True
+        except Exception as e:
+            logger.error(f"新增或更新商品信息失败: {e}")
+            self.conn.rollback()
+            return False
+
     def save_item_info(self, cookie_id: str, item_id: str, item_data = None) -> bool:
         """保存或更新商品信息
 
@@ -3938,6 +4158,28 @@ class DBManager:
             logger.error(f"获取商品多数量发货状态失败: {e}")
             return False
 
+    @staticmethod
+    def _decorate_item_result(item_info: Dict) -> Dict:
+        """补充前端商品字段，同时保持数据库详情中的其他字段。"""
+        parsed_detail = {}
+        if item_info.get('item_detail'):
+            try:
+                parsed_detail = json.loads(item_info['item_detail'])
+            except (TypeError, ValueError):
+                parsed_detail = {}
+
+            item_info['item_detail_parsed'] = parsed_detail
+
+        pic_info = parsed_detail.get('pic_info') if isinstance(parsed_detail, dict) else None
+        item_image = pic_info.get('picUrl') if isinstance(pic_info, dict) else None
+        if isinstance(item_image, str) and item_image.startswith('//'):
+            item_image = f'https:{item_image}'
+            pic_info['picUrl'] = item_image
+
+        item_info['item_image'] = item_image or ''
+        item_info['is_multi_qty_ship'] = bool(item_info.get('multi_quantity_delivery'))
+        return item_info
+
     def get_items_by_cookie(self, cookie_id: str) -> List[Dict]:
         """获取指定Cookie的所有商品信息
 
@@ -3961,15 +4203,7 @@ class DBManager:
 
                 for row in cursor.fetchall():
                     item_info = dict(zip(columns, row))
-
-                    # 解析item_detail JSON
-                    if item_info.get('item_detail'):
-                        try:
-                            item_info['item_detail_parsed'] = json.loads(item_info['item_detail'])
-                        except:
-                            item_info['item_detail_parsed'] = {}
-
-                    items.append(item_info)
+                    items.append(self._decorate_item_result(item_info))
 
                 return items
 
@@ -3996,15 +4230,7 @@ class DBManager:
 
                 for row in cursor.fetchall():
                     item_info = dict(zip(columns, row))
-
-                    # 解析item_detail JSON
-                    if item_info.get('item_detail'):
-                        try:
-                            item_info['item_detail_parsed'] = json.loads(item_info['item_detail'])
-                        except:
-                            item_info['item_detail_parsed'] = {}
-
-                    items.append(item_info)
+                    items.append(self._decorate_item_result(item_info))
 
                 return items
 
@@ -4200,6 +4426,69 @@ class DBManager:
             logger.error(f"删除商品信息失败: {e}")
             self.conn.rollback()
             return False
+
+    def replace_item_skus(self, cookie_id: str, item_id: str, skus: list) -> bool:
+        """用一次成功的闲鱼读取结果原子替换商品 SKU 快照。"""
+        if not cookie_id or not item_id or not skus:
+            return False
+
+        with self.lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute('BEGIN IMMEDIATE')
+                cursor.execute(
+                    'DELETE FROM item_skus WHERE cookie_id = ? AND item_id = ?',
+                    (cookie_id, item_id)
+                )
+                for sku in skus:
+                    cursor.execute('''
+                        INSERT INTO item_skus (
+                            cookie_id, item_id, sku_id, properties_json,
+                            display_name, price_cent, quantity, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ''', (
+                        cookie_id,
+                        item_id,
+                        str(sku['sku_id']),
+                        json.dumps(sku['properties'], ensure_ascii=False),
+                        sku['display_name'],
+                        sku.get('price_cent'),
+                        sku.get('quantity'),
+                    ))
+                self.conn.commit()
+                return True
+            except Exception as e:
+                self.conn.rollback()
+                logger.error(f"保存商品 SKU 失败: {cookie_id}/{item_id} - {e}")
+                return False
+
+    def get_item_skus(self, cookie_id: str, item_id: str) -> List[Dict]:
+        """读取商品最近一次同步的 SKU 快照。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    SELECT sku_id, properties_json, display_name,
+                           price_cent, quantity, updated_at
+                    FROM item_skus
+                    WHERE cookie_id = ? AND item_id = ?
+                    ORDER BY id
+                ''', (cookie_id, item_id))
+                result = []
+                for row in cursor.fetchall():
+                    result.append({
+                        'sku_id': row[0],
+                        'properties': json.loads(row[1]),
+                        'display_name': row[2],
+                        'price_cent': row[3],
+                        'price': row[3] / 100 if row[3] is not None else None,
+                        'quantity': row[4],
+                        'updated_at': row[5],
+                    })
+                return result
+            except Exception as e:
+                logger.error(f"读取商品 SKU 失败: {cookie_id}/{item_id} - {e}")
+                return []
 
     def batch_delete_item_info(self, items_to_delete: list) -> int:
         """批量删除商品信息
@@ -4452,6 +4741,85 @@ class DBManager:
             except Exception as e:
                 logger.error(f"获取表数据失败: {table_name} - {e}")
                 return [], []
+
+    def get_redemption_delivery(self, order_id: str) -> Optional[Dict[str, Any]]:
+        """读取订单已经生成的兑换码，用于本地幂等。"""
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                SELECT order_id, sku, code, code_masked, response_status, delivered_at,
+                       created_at, updated_at
+                FROM redemption_deliveries WHERE order_id = ?
+            ''', (order_id,))
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return {
+                'order_id': row[0], 'sku': row[1], 'code': row[2], 'code_masked': row[3],
+                'response_status': row[4], 'delivered_at': row[5],
+                'created_at': row[6], 'updated_at': row[7],
+            }
+
+    def save_redemption_delivery(self, order_id: str, sku: str, code: str,
+                                 response_status: int) -> bool:
+        """保存兑换码；同订单不同 SKU 永不覆盖。"""
+        from utils.weiban_redemption import mask_code
+
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('SELECT sku, code FROM redemption_deliveries WHERE order_id = ?', (order_id,))
+                existing = cursor.fetchone()
+                if existing:
+                    return existing[0] == sku and existing[1] == code
+                cursor.execute('''
+                    INSERT INTO redemption_deliveries
+                    (order_id, sku, code, code_masked, response_status)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (order_id, sku, code, mask_code(code), response_status))
+                self.conn.commit()
+                return True
+            except Exception as e:
+                self.conn.rollback()
+                logger.error(f"保存兑换码发货记录失败: order_id={order_id}, type={type(e).__name__}")
+                return False
+
+    def mark_redemption_delivered(self, order_id: str, sku: str) -> bool:
+        """消息发送成功后标记兑换码已交付。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    UPDATE redemption_deliveries
+                    SET delivered_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+                    WHERE order_id = ? AND sku = ? AND code <> ''
+                ''', (order_id, sku))
+                self.conn.commit()
+                return cursor.rowcount == 1
+            except Exception as e:
+                self.conn.rollback()
+                logger.error(f"标记兑换码已交付失败: order_id={order_id}, type={type(e).__name__}")
+                return False
+
+    def add_redemption_request_audit(self, order_id: str, sku: str,
+                                     response_status: Optional[int], outcome: str,
+                                     masked_code: str = '', error_detail: str = '',
+                                     attempt_no: int = 0) -> bool:
+        """追加一次兑换码请求审计，不记录 Key 或完整兑换码。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    INSERT INTO redemption_request_audit
+                    (order_id, sku, response_status, outcome, masked_code, error_detail, attempt_no)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (order_id, sku, response_status, outcome, masked_code, error_detail, attempt_no))
+                self.conn.commit()
+                return True
+            except Exception as e:
+                self.conn.rollback()
+                logger.error(f"写入兑换码审计失败: order_id={order_id}, type={type(e).__name__}")
+                return False
 
     def insert_or_update_order(self, order_id: str, item_id: str = None, buyer_id: str = None,
                               spec_name: str = None, spec_value: str = None, quantity: str = None,

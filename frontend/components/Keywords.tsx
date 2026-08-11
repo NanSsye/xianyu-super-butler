@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { AccountDetail, ShippingRule, ReplyRule, DefaultReply } from '../types';
-import { getAccountDetails, getReplyRules, updateReplyRule, deleteReplyRule, getShippingRules, updateShippingRule, deleteShippingRule, getCards, getDefaultReplies, getDefaultReply, updateDefaultReply, deleteDefaultReply, clearDefaultReplyRecords } from '../services/api';
+import { AccountDetail, ShippingRule, ReplyRule, DefaultReply, Item } from '../types';
+import { getAccountDetails, getReplyRules, updateReplyRule, deleteReplyRule, getShippingRules, updateShippingRule, deleteShippingRule, getCards, getItems, getDefaultReplies, getDefaultReply, updateDefaultReply, deleteDefaultReply, clearDefaultReplyRecords } from '../services/api';
 import { Plus, Trash2, MessageSquare, X, Save, Loader2, Key, Truck, Power, PowerOff, Edit2, RefreshCw, Sparkles, Bot } from 'lucide-react';
 
 type TabType = 'reply' | 'delivery' | 'default';
@@ -46,6 +46,7 @@ const Keywords: React.FC = () => {
   // 关键词发货相关状态
   const [shippingRules, setShippingRules] = useState<ShippingRule[]>([]);
   const [cards, setCards] = useState<any[]>([]);
+  const [items, setItems] = useState<Item[]>([]);
   const [showDeliveryModal, setShowDeliveryModal] = useState(false);
   const [editingDeliveryRule, setEditingDeliveryRule] = useState<ShippingRule | null>(null);
   const [deliveryForm, setDeliveryForm] = useState<DeliveryRuleForm>({
@@ -84,6 +85,7 @@ const Keywords: React.FC = () => {
       loadKeywords();
       loadShippingRules();
       loadCards();
+      loadItems();
       loadDefaultReplies();
     }
   }, [selectedAccount]);
@@ -113,6 +115,23 @@ const Keywords: React.FC = () => {
     } catch (e) {
       console.error('加载卡券失败', e);
     }
+  };
+
+  const loadItems = async () => {
+    try {
+      setItems(await getItems());
+    } catch (e) {
+      console.error('加载商品失败', e);
+    }
+  };
+
+  const getMatchedItems = (keyword: string): Item[] => {
+    const normalizedKeyword = keyword.trim().toLocaleLowerCase();
+    if (!normalizedKeyword) return [];
+    return items.filter((item) => {
+      const title = (item.item_title || '').trim().toLocaleLowerCase();
+      return title && (title.includes(normalizedKeyword) || normalizedKeyword.includes(title));
+    });
   };
 
   const loadKeywords = async () => {
@@ -549,6 +568,11 @@ const Keywords: React.FC = () => {
                   </div>
                   <p className="text-gray-600 bg-white/70 backdrop-blur-sm rounded-2xl px-4 py-3 shadow-inner border border-gray-100">
                     🎁 卡券：{rule.card_group_name || `ID: ${rule.card_group_id}`}
+                    {rule.is_multi_spec && rule.spec_name && rule.spec_value && (
+                      <span className="ml-2 inline-flex rounded-lg bg-blue-100 px-2 py-1 text-xs font-bold text-blue-700">
+                        规格：{rule.spec_name} / {rule.spec_value}
+                      </span>
+                    )}
                     {rule.name && (
                       <>
                         <span className="mx-2 text-gray-300">|</span>
@@ -556,6 +580,23 @@ const Keywords: React.FC = () => {
                       </>
                     )}
                   </p>
+                  <div className="mt-2 rounded-2xl border border-blue-100 bg-blue-50/70 px-4 py-3 text-sm text-gray-700">
+                    <span className="font-bold text-gray-900">当前匹配商品：</span>
+                    {getMatchedItems(rule.item_keyword).length > 0 ? (
+                      <span>
+                        {getMatchedItems(rule.item_keyword).map((item) => (
+                          <span key={`${item.cookie_id}-${item.item_id}`} className="ml-2 inline-block">
+                            {item.item_title || '未命名商品'}（ID: {item.item_id}）
+                          </span>
+                        ))}
+                        {getMatchedItems(rule.item_keyword).length > 1 && (
+                          <span className="ml-2 font-bold text-amber-600">匹配多个商品</span>
+                        )}
+                      </span>
+                    ) : (
+                      <span className="ml-2 font-bold text-red-600">未匹配到已加载商品</span>
+                    )}
+                  </div>
                 </div>
 
                 {/* 操作按钮 */}
@@ -815,7 +856,15 @@ const Keywords: React.FC = () => {
                   placeholder="例如：发货卡密、自动发货"
                   className="w-full px-6 py-4 rounded-2xl font-medium border-2 border-gray-200 focus:border-blue-400 focus:ring-4 focus:ring-blue-400/20 transition-all bg-gray-50"
                 />
-                <p className="text-sm text-gray-500 mt-2 ml-1">💡 买家消息中包含此关键词时自动发货</p>
+                <p className="text-sm text-gray-500 mt-2 ml-1">💡 商品标题中包含此关键词时匹配；多规格会继续按卡券规格精确筛选</p>
+                {deliveryForm.keyword.trim() && (
+                  <div className="mt-3 rounded-xl border border-blue-100 bg-blue-50 px-4 py-3 text-sm">
+                    <span className="font-bold">当前匹配：</span>
+                    {getMatchedItems(deliveryForm.keyword).length > 0
+                      ? getMatchedItems(deliveryForm.keyword).map((item) => `${item.item_title || '未命名商品'}（${item.item_id}）`).join('、')
+                      : '没有匹配到已加载商品'}
+                  </div>
+                )}
               </div>
 
               <div>
@@ -836,7 +885,7 @@ const Keywords: React.FC = () => {
                     </option>
                   ))}
                 </select>
-                <p className="text-sm text-gray-500 mt-2 ml-1">🎁 选择触发关键词时发送的卡券</p>
+                <p className="text-sm text-gray-500 mt-2 ml-1">🎁 规格绑定在“卡密库存”中设置，这里会显示规格名称和规格值</p>
               </div>
 
               <div>
