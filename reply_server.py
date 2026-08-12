@@ -4162,6 +4162,75 @@ async def update_card_with_image(
 
 
 # 自动发货规则API
+def _prepare_delivery_rule_data(rule_data: dict, user_id: int) -> dict:
+    """校验并规范化规则绑定，所有商品和 SKU 信息只信任服务端快照。"""
+    card_id = rule_data.get('card_id')
+    try:
+        card_id = int(card_id)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="请选择有效卡券")
+    if not db_manager.get_card_by_id(card_id, user_id):
+        raise HTTPException(status_code=404, detail="卡券不存在或不属于当前用户")
+
+    cookie_id = str(rule_data.get('cookie_id') or '').strip()
+    item_id = str(rule_data.get('item_id') or '').strip()
+    sku_id = str(rule_data.get('sku_id') or '').strip()
+    keyword = str(rule_data.get('keyword') or '').strip()
+
+    if bool(cookie_id) != bool(item_id):
+        raise HTTPException(status_code=422, detail="账号和商品必须同时选择")
+
+    sku_properties_json = None
+    sku_display_name = None
+    if item_id:
+        user_cookies = db_manager.get_all_cookies(user_id)
+        if cookie_id not in user_cookies:
+            raise HTTPException(status_code=403, detail="无权限使用该闲鱼账号")
+
+        item = db_manager.get_item_info(cookie_id, item_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="商品不存在，请先同步商品")
+
+        keyword = str(item.get('item_title') or item_id).strip()
+        if bool(item.get('is_multi_spec')):
+            if not sku_id:
+                raise HTTPException(status_code=422, detail="多规格商品必须选择一个具体规格")
+            selected_sku = next(
+                (sku for sku in db_manager.get_item_skus(cookie_id, item_id)
+                 if str(sku.get('sku_id')) == sku_id),
+                None,
+            )
+            if not selected_sku:
+                raise HTTPException(status_code=422, detail="所选规格不存在，请重新同步商品规格")
+            sku_properties_json = json.dumps(
+                selected_sku.get('properties') or [],
+                ensure_ascii=False,
+                separators=(',', ':'),
+            )
+            sku_display_name = str(selected_sku.get('display_name') or '').strip()
+        else:
+            if sku_id:
+                raise HTTPException(status_code=422, detail="单规格商品不能绑定 SKU")
+            sku_id = ''
+            sku_properties_json = '[]'
+            sku_display_name = ''
+    elif not keyword:
+        raise HTTPException(status_code=422, detail="请选择商品；旧规则兼容模式下必须提供关键词")
+
+    return {
+        'keyword': keyword,
+        'card_id': card_id,
+        'delivery_count': int(rule_data.get('delivery_count', 1) or 1),
+        'enabled': bool(rule_data.get('enabled', True)),
+        'description': str(rule_data.get('description') or '').strip(),
+        'cookie_id': cookie_id or None,
+        'item_id': item_id or None,
+        'sku_id': sku_id if item_id else None,
+        'sku_properties_json': sku_properties_json,
+        'sku_display_name': sku_display_name,
+    }
+
+
 @app.get("/delivery-rules")
 def get_delivery_rules(current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取发货规则列表"""
@@ -4178,17 +4247,14 @@ def get_delivery_rules(current_user: Dict[str, Any] = Depends(get_current_user))
 def create_delivery_rule(rule_data: dict, current_user: Dict[str, Any] = Depends(get_current_user)):
     """创建新发货规则"""
     try:
-        from db_manager import db_manager
         user_id = current_user['user_id']
-        rule_id = db_manager.create_delivery_rule(
-            keyword=rule_data.get('keyword'),
-            card_id=rule_data.get('card_id'),
-            delivery_count=rule_data.get('delivery_count', 1),
-            enabled=rule_data.get('enabled', True),
-            description=rule_data.get('description'),
-            user_id=user_id
-        )
+        normalized = _prepare_delivery_rule_data(rule_data, user_id)
+        rule_id = db_manager.create_delivery_rule(user_id=user_id, **normalized)
         return {"id": rule_id, "message": "发货规则创建成功"}
+    except HTTPException:
+        raise
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=409, detail="该商品规格已经绑定了发货规则")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -4212,21 +4278,23 @@ def get_delivery_rule(rule_id: int, current_user: Dict[str, Any] = Depends(get_c
 def update_delivery_rule(rule_id: int, rule_data: dict, current_user: Dict[str, Any] = Depends(get_current_user)):
     """更新发货规则"""
     try:
-        from db_manager import db_manager
         user_id = current_user['user_id']
+        if not db_manager.get_delivery_rule_by_id(rule_id, user_id):
+            raise HTTPException(status_code=404, detail="发货规则不存在")
+        normalized = _prepare_delivery_rule_data(rule_data, user_id)
         success = db_manager.update_delivery_rule(
             rule_id=rule_id,
-            keyword=rule_data.get('keyword'),
-            card_id=rule_data.get('card_id'),
-            delivery_count=rule_data.get('delivery_count', 1),
-            enabled=rule_data.get('enabled', True),
-            description=rule_data.get('description'),
-            user_id=user_id
+            user_id=user_id,
+            **normalized,
         )
         if success:
             return {"message": "发货规则更新成功"}
         else:
             raise HTTPException(status_code=404, detail="发货规则不存在")
+    except HTTPException:
+        raise
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=409, detail="该商品规格已经绑定了其他发货规则")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

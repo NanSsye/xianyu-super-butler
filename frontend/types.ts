@@ -136,7 +136,14 @@ export interface ItemSku {
 export interface ShippingRule {
   id: string;
   name: string;
-  item_keyword: string; // Matches item title
+  item_keyword: string; // 旧规则兼容字段
+  cookie_id?: string;
+  item_id?: string;
+  item_title?: string;
+  sku_id?: string;
+  sku_properties?: Array<{ name: string; value: string }>;
+  sku_display_name?: string;
+  binding_mode?: 'item' | 'legacy_keyword';
   card_group_id: number; // ID from Card list
   card_group_name?: string; // UI helper
   card_type?: string;

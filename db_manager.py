@@ -410,6 +410,11 @@ class DBManager:
                 keyword TEXT NOT NULL,
                 card_id INTEGER NOT NULL,
                 user_id INTEGER NOT NULL DEFAULT 1,
+                cookie_id TEXT,
+                item_id TEXT,
+                sku_id TEXT,
+                sku_properties_json TEXT,
+                sku_display_name TEXT,
                 delivery_count INTEGER DEFAULT 1,
                 enabled BOOLEAN DEFAULT TRUE,
                 description TEXT,
@@ -646,6 +651,39 @@ class DBManager:
                 "CREATE INDEX IF NOT EXISTS idx_delivery_rules_user_id "
                 "ON delivery_rules(user_id)"
             )
+
+            # 新规则直接绑定闲鱼商品和可选 SKU。旧规则保持这些字段为空，
+            # 继续使用关键词匹配，方便用户逐条迁移而不中断现有发货。
+            cursor.execute("PRAGMA table_info(delivery_rules)")
+            delivery_rule_columns = {column[1] for column in cursor.fetchall()}
+            for column_name, column_type in (
+                ('cookie_id', 'TEXT'),
+                ('item_id', 'TEXT'),
+                ('sku_id', 'TEXT'),
+                ('sku_properties_json', 'TEXT'),
+                ('sku_display_name', 'TEXT'),
+            ):
+                if column_name not in delivery_rule_columns:
+                    cursor.execute(
+                        f"ALTER TABLE delivery_rules ADD COLUMN {column_name} {column_type}"
+                    )
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_delivery_rules_item_binding
+                ON delivery_rules(user_id, cookie_id, item_id)
+            ''')
+            cursor.execute('''
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_delivery_rules_bound_item
+                ON delivery_rules(user_id, cookie_id, item_id)
+                WHERE item_id IS NOT NULL AND item_id <> ''
+                  AND (sku_id IS NULL OR sku_id = '')
+            ''')
+            cursor.execute('''
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_delivery_rules_bound_sku
+                ON delivery_rules(user_id, cookie_id, item_id, sku_id)
+                WHERE item_id IS NOT NULL AND item_id <> ''
+                  AND sku_id IS NOT NULL AND sku_id <> ''
+            ''')
             logger.info("delivery_rules 表 user_id 迁移完成")
 
             # 检查cookies表是否存在remark列
@@ -3291,15 +3329,22 @@ class DBManager:
     # ==================== 自动发货规则方法 ====================
 
     def create_delivery_rule(self, keyword: str, card_id: int, delivery_count: int = 1,
-                           enabled: bool = True, description: str = None, user_id: int = None):
+                           enabled: bool = True, description: str = None, user_id: int = None,
+                           cookie_id: str = None, item_id: str = None, sku_id: str = None,
+                           sku_properties_json: str = None, sku_display_name: str = None):
         """创建发货规则"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                INSERT INTO delivery_rules (keyword, card_id, delivery_count, enabled, description, user_id)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ''', (keyword, card_id, delivery_count, enabled, description, user_id))
+                INSERT INTO delivery_rules (
+                    keyword, card_id, delivery_count, enabled, description, user_id,
+                    cookie_id, item_id, sku_id, sku_properties_json, sku_display_name
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    keyword, card_id, delivery_count, enabled, description, user_id,
+                    cookie_id, item_id, sku_id, sku_properties_json, sku_display_name
+                ))
                 self.conn.commit()
                 rule_id = cursor.lastrowid
                 logger.info(f"创建发货规则成功: {keyword} -> 卡券ID {card_id} (规则ID: {rule_id})")
@@ -3318,9 +3363,14 @@ class DBManager:
                     SELECT dr.id, dr.keyword, dr.card_id, dr.delivery_count, dr.enabled,
                            dr.description, dr.delivery_times, dr.created_at, dr.updated_at,
                            c.name as card_name, c.type as card_type,
-                           c.is_multi_spec, c.spec_name, c.spec_value
+                           c.is_multi_spec, c.spec_name, c.spec_value,
+                           dr.cookie_id, dr.item_id, dr.sku_id,
+                           dr.sku_properties_json, dr.sku_display_name,
+                           i.item_title
                     FROM delivery_rules dr
                     LEFT JOIN cards c ON dr.card_id = c.id
+                    LEFT JOIN item_info i
+                      ON i.cookie_id = dr.cookie_id AND i.item_id = dr.item_id
                     WHERE dr.user_id = ?
                     ORDER BY dr.created_at DESC
                     ''', (user_id,))
@@ -3329,14 +3379,23 @@ class DBManager:
                     SELECT dr.id, dr.keyword, dr.card_id, dr.delivery_count, dr.enabled,
                            dr.description, dr.delivery_times, dr.created_at, dr.updated_at,
                            c.name as card_name, c.type as card_type,
-                           c.is_multi_spec, c.spec_name, c.spec_value
+                           c.is_multi_spec, c.spec_name, c.spec_value,
+                           dr.cookie_id, dr.item_id, dr.sku_id,
+                           dr.sku_properties_json, dr.sku_display_name,
+                           i.item_title
                     FROM delivery_rules dr
                     LEFT JOIN cards c ON dr.card_id = c.id
+                    LEFT JOIN item_info i
+                      ON i.cookie_id = dr.cookie_id AND i.item_id = dr.item_id
                     ORDER BY dr.created_at DESC
                     ''')
 
                 rules = []
                 for row in cursor.fetchall():
+                    try:
+                        sku_properties = json.loads(row[17]) if row[17] else []
+                    except (json.JSONDecodeError, TypeError):
+                        sku_properties = []
                     rules.append({
                         'id': row[0],
                         'keyword': row[1],
@@ -3351,7 +3410,14 @@ class DBManager:
                         'card_type': row[10],
                         'is_multi_spec': bool(row[11]) if row[11] is not None else False,
                         'spec_name': row[12],
-                        'spec_value': row[13]
+                        'spec_value': row[13],
+                        'cookie_id': row[14],
+                        'item_id': row[15],
+                        'sku_id': row[16],
+                        'sku_properties': sku_properties,
+                        'sku_display_name': row[18],
+                        'item_title': row[19],
+                        'binding_mode': 'item' if row[15] else 'legacy_keyword',
                     })
 
                 return rules
@@ -3375,6 +3441,7 @@ class DBManager:
                 FROM delivery_rules dr
                 LEFT JOIN cards c ON dr.card_id = c.id
                 WHERE dr.enabled = 1 AND c.enabled = 1
+                AND (dr.item_id IS NULL OR dr.item_id = '')
                 AND (? LIKE '%' || dr.keyword || '%' OR dr.keyword LIKE '%' || ? || '%')
                 ORDER BY
                     CASE
@@ -3423,6 +3490,109 @@ class DBManager:
                 logger.error(f"根据关键字获取发货规则失败: {e}")
                 return []
 
+    def has_delivery_rule_bindings(self, cookie_id: str, item_id: str) -> bool:
+        """判断商品是否已经切换为显式规则绑定，包括已禁用规则。"""
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                SELECT 1
+                FROM delivery_rules
+                WHERE cookie_id = ? AND item_id = ?
+                LIMIT 1
+            ''', (cookie_id, item_id))
+            return cursor.fetchone() is not None
+
+    def get_delivery_rules_by_item(self, cookie_id: str, item_id: str,
+                                   spec_name: str = None, spec_value: str = None):
+        """按闲鱼商品和订单规格精确获取启用的发货规则。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    SELECT dr.id, dr.keyword, dr.card_id, dr.delivery_count, dr.enabled,
+                           dr.description, dr.delivery_times,
+                           c.name AS card_name, c.type AS card_type, c.api_config,
+                           c.text_content, c.data_content, c.image_url,
+                           c.enabled AS card_enabled, c.description AS card_description,
+                           c.delay_seconds AS card_delay_seconds,
+                           c.is_multi_spec, c.spec_name, c.spec_value,
+                           dr.cookie_id, dr.item_id, dr.sku_id,
+                           dr.sku_properties_json, dr.sku_display_name
+                    FROM delivery_rules dr
+                    JOIN cards c ON dr.card_id = c.id
+                    WHERE dr.cookie_id = ? AND dr.item_id = ?
+                      AND dr.enabled = 1 AND c.enabled = 1
+                    ORDER BY dr.delivery_times ASC, dr.id ASC
+                ''', (cookie_id, item_id))
+
+                rules = []
+                normalized_spec_name = (spec_name or '').strip()
+                normalized_spec_value = (spec_value or '').strip()
+                for row in cursor.fetchall():
+                    try:
+                        properties = json.loads(row[22]) if row[22] else []
+                    except (json.JSONDecodeError, TypeError):
+                        properties = []
+
+                    bound_sku_id = (row[21] or '').strip()
+                    if bound_sku_id:
+                        if not normalized_spec_name or not normalized_spec_value:
+                            continue
+                        property_matches = any(
+                            str(prop.get('name') or '').strip() == normalized_spec_name
+                            and str(prop.get('value') or '').strip() == normalized_spec_value
+                            for prop in properties
+                            if isinstance(prop, dict)
+                        )
+                        display_name = (row[23] or '').strip()
+                        display_matches = display_name in {
+                            normalized_spec_value,
+                            f'{normalized_spec_name}: {normalized_spec_value}',
+                        }
+                        if not property_matches and not display_matches:
+                            continue
+                    elif normalized_spec_name or normalized_spec_value:
+                        continue
+
+                    api_config = row[9]
+                    if api_config:
+                        try:
+                            api_config = json.loads(api_config)
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+
+                    rules.append({
+                        'id': row[0],
+                        'keyword': row[1],
+                        'card_id': row[2],
+                        'delivery_count': row[3],
+                        'enabled': bool(row[4]),
+                        'description': row[5],
+                        'delivery_times': row[6] or 0,
+                        'card_name': row[7],
+                        'card_type': row[8],
+                        'api_config': api_config,
+                        'text_content': row[10],
+                        'data_content': row[11],
+                        'image_url': row[12],
+                        'card_enabled': bool(row[13]),
+                        'card_description': row[14],
+                        'card_delay_seconds': row[15] or 0,
+                        'is_multi_spec': bool(row[16]) if row[16] is not None else False,
+                        'spec_name': row[17],
+                        'spec_value': row[18],
+                        'cookie_id': row[19],
+                        'item_id': row[20],
+                        'sku_id': row[21],
+                        'sku_properties': properties,
+                        'sku_display_name': row[23],
+                        'binding_mode': 'item',
+                    })
+                return rules
+            except Exception as e:
+                logger.error(f"按商品获取发货规则失败: {cookie_id}/{item_id} - {e}")
+                return []
+
     def get_delivery_rule_by_id(self, rule_id: int, user_id: int = None):
         """根据ID获取发货规则（支持用户隔离）"""
         with self.lock:
@@ -3432,7 +3602,9 @@ class DBManager:
                     self._execute_sql(cursor, '''
                     SELECT dr.id, dr.keyword, dr.card_id, dr.delivery_count, dr.enabled,
                            dr.description, dr.delivery_times, dr.created_at, dr.updated_at,
-                           c.name as card_name, c.type as card_type
+                           c.name as card_name, c.type as card_type,
+                           dr.cookie_id, dr.item_id, dr.sku_id,
+                           dr.sku_properties_json, dr.sku_display_name
                     FROM delivery_rules dr
                     LEFT JOIN cards c ON dr.card_id = c.id
                     WHERE dr.id = ? AND dr.user_id = ?
@@ -3441,7 +3613,9 @@ class DBManager:
                     self._execute_sql(cursor, '''
                     SELECT dr.id, dr.keyword, dr.card_id, dr.delivery_count, dr.enabled,
                            dr.description, dr.delivery_times, dr.created_at, dr.updated_at,
-                           c.name as card_name, c.type as card_type
+                           c.name as card_name, c.type as card_type,
+                           dr.cookie_id, dr.item_id, dr.sku_id,
+                           dr.sku_properties_json, dr.sku_display_name
                     FROM delivery_rules dr
                     LEFT JOIN cards c ON dr.card_id = c.id
                     WHERE dr.id = ?
@@ -3449,6 +3623,10 @@ class DBManager:
 
                 row = cursor.fetchone()
                 if row:
+                    try:
+                        sku_properties = json.loads(row[14]) if row[14] else []
+                    except (json.JSONDecodeError, TypeError):
+                        sku_properties = []
                     return {
                         'id': row[0],
                         'keyword': row[1],
@@ -3460,7 +3638,13 @@ class DBManager:
                         'created_at': row[7],
                         'updated_at': row[8],
                         'card_name': row[9],
-                        'card_type': row[10]
+                        'card_type': row[10],
+                        'cookie_id': row[11],
+                        'item_id': row[12],
+                        'sku_id': row[13],
+                        'sku_properties': sku_properties,
+                        'sku_display_name': row[15],
+                        'binding_mode': 'item' if row[12] else 'legacy_keyword',
                     }
                 return None
             except Exception as e:
@@ -3469,7 +3653,9 @@ class DBManager:
 
     def update_delivery_rule(self, rule_id: int, keyword: str = None, card_id: int = None,
                            delivery_count: int = None, enabled: bool = None,
-                           description: str = None, user_id: int = None):
+                           description: str = None, user_id: int = None,
+                           cookie_id: str = None, item_id: str = None, sku_id: str = None,
+                           sku_properties_json: str = None, sku_display_name: str = None):
         """更新发货规则（支持用户隔离）"""
         with self.lock:
             try:
@@ -3494,6 +3680,21 @@ class DBManager:
                 if description is not None:
                     update_fields.append("description = ?")
                     params.append(description)
+                if cookie_id is not None:
+                    update_fields.append("cookie_id = ?")
+                    params.append(cookie_id)
+                if item_id is not None:
+                    update_fields.append("item_id = ?")
+                    params.append(item_id)
+                if sku_id is not None:
+                    update_fields.append("sku_id = ?")
+                    params.append(sku_id)
+                if sku_properties_json is not None:
+                    update_fields.append("sku_properties_json = ?")
+                    params.append(sku_properties_json)
+                if sku_display_name is not None:
+                    update_fields.append("sku_display_name = ?")
+                    params.append(sku_display_name)
 
                 if not update_fields:
                     return True  # 没有需要更新的字段
@@ -3554,6 +3755,7 @@ class DBManager:
                     FROM delivery_rules dr
                     LEFT JOIN cards c ON dr.card_id = c.id
                     WHERE dr.enabled = 1 AND c.enabled = 1
+                    AND (dr.item_id IS NULL OR dr.item_id = '')
                     AND (? LIKE '%' || dr.keyword || '%' OR dr.keyword LIKE '%' || ? || '%')
                     AND c.is_multi_spec = 1 AND c.spec_name = ? AND c.spec_value = ?
                     ORDER BY
@@ -3612,6 +3814,7 @@ class DBManager:
                 FROM delivery_rules dr
                 LEFT JOIN cards c ON dr.card_id = c.id
                 WHERE dr.enabled = 1 AND c.enabled = 1
+                AND (dr.item_id IS NULL OR dr.item_id = '')
                 AND (? LIKE '%' || dr.keyword || '%' OR dr.keyword LIKE '%' || ? || '%')
                 AND (c.is_multi_spec = 0 OR c.is_multi_spec IS NULL)
                 ORDER BY

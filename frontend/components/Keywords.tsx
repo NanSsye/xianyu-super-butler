@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { AccountDetail, ShippingRule, ReplyRule, DefaultReply, Item } from '../types';
-import { getAccountDetails, getReplyRules, updateReplyRule, deleteReplyRule, getShippingRules, updateShippingRule, deleteShippingRule, getCards, getItems, getDefaultReplies, getDefaultReply, updateDefaultReply, deleteDefaultReply, clearDefaultReplyRecords } from '../services/api';
+import { AccountDetail, ShippingRule, ReplyRule, DefaultReply, Item, ItemSku } from '../types';
+import { getAccountDetails, getReplyRules, updateReplyRule, deleteReplyRule, getShippingRules, updateShippingRule, deleteShippingRule, getCards, getItems, getItemSkus, syncItemSkus, getDefaultReplies, getDefaultReply, updateDefaultReply, deleteDefaultReply, clearDefaultReplyRecords } from '../services/api';
 import { Plus, Trash2, MessageSquare, X, Save, Loader2, Key, Truck, Power, PowerOff, Edit2, RefreshCw, Sparkles, Bot } from 'lucide-react';
 
 type TabType = 'reply' | 'delivery' | 'default';
@@ -15,7 +15,9 @@ interface Keyword {
 }
 
 interface DeliveryRuleForm {
-  keyword: string;
+  cookie_id: string;
+  item_id: string;
+  sku_id: string;
   card_id: string;
   description: string;
   enabled: boolean;
@@ -50,11 +52,15 @@ const Keywords: React.FC = () => {
   const [showDeliveryModal, setShowDeliveryModal] = useState(false);
   const [editingDeliveryRule, setEditingDeliveryRule] = useState<ShippingRule | null>(null);
   const [deliveryForm, setDeliveryForm] = useState<DeliveryRuleForm>({
-    keyword: '',
+    cookie_id: '',
+    item_id: '',
+    sku_id: '',
     card_id: '',
     description: '',
     enabled: true
   });
+  const [deliverySkus, setDeliverySkus] = useState<ItemSku[]>([]);
+  const [skuLoading, setSkuLoading] = useState(false);
 
   // 账号默认回复相关状态
   const [defaultReplies, setDefaultReplies] = useState<Record<string, DefaultReply>>({});
@@ -125,13 +131,54 @@ const Keywords: React.FC = () => {
     }
   };
 
-  const getMatchedItems = (keyword: string): Item[] => {
-    const normalizedKeyword = keyword.trim().toLocaleLowerCase();
-    if (!normalizedKeyword) return [];
-    return items.filter((item) => {
-      const title = (item.item_title || '').trim().toLocaleLowerCase();
-      return title && (title.includes(normalizedKeyword) || normalizedKeyword.includes(title));
-    });
+  const accountItems = items.filter((item) => item.cookie_id === selectedAccount);
+  const selectedDeliveryItem = accountItems.find((item) => item.item_id === deliveryForm.item_id);
+  const visibleShippingRules = shippingRules.filter(
+    (rule) => !rule.cookie_id || rule.cookie_id === selectedAccount
+  );
+
+  const loadDeliverySkus = async (cookieId: string, itemId: string) => {
+    if (!cookieId || !itemId) {
+      setDeliverySkus([]);
+      return;
+    }
+    setSkuLoading(true);
+    try {
+      setDeliverySkus(await getItemSkus(cookieId, itemId));
+    } catch (e) {
+      setDeliverySkus([]);
+      console.error('加载商品规格失败', e);
+    } finally {
+      setSkuLoading(false);
+    }
+  };
+
+  const handleDeliveryItemChange = async (itemId: string) => {
+    setDeliveryForm((current) => ({ ...current, item_id: itemId, sku_id: '' }));
+    const item = accountItems.find((candidate) => candidate.item_id === itemId);
+    if (item && Boolean(item.is_multi_spec)) {
+      await loadDeliverySkus(item.cookie_id, item.item_id);
+    } else {
+      setDeliverySkus([]);
+    }
+  };
+
+  const handleSyncDeliverySkus = async () => {
+    if (!selectedDeliveryItem) return;
+    setSkuLoading(true);
+    try {
+      const result = await syncItemSkus(
+        selectedDeliveryItem.cookie_id,
+        selectedDeliveryItem.item_id
+      );
+      const skus = result.skus || [];
+      setDeliverySkus(skus);
+      if (!skus.length) alert(result.message || '没有读取到商品规格');
+    } catch (e) {
+      alert('同步规格失败：' + (e as Error).message);
+    } finally {
+      setSkuLoading(false);
+    }
   };
 
   const loadKeywords = async () => {
@@ -154,7 +201,15 @@ const Keywords: React.FC = () => {
       setShowReplyModal(true);
     } else if (activeTab === 'delivery') {
       setEditingDeliveryRule(null);
-      setDeliveryForm({ keyword: '', card_id: '', description: '', enabled: true });
+      setDeliveryForm({
+        cookie_id: selectedAccount,
+        item_id: '',
+        sku_id: '',
+        card_id: '',
+        description: '',
+        enabled: true
+      });
+      setDeliverySkus([]);
       setShowDeliveryModal(true);
     } else {
       // default tab - 编辑选中账号的默认回复
@@ -204,11 +259,18 @@ const Keywords: React.FC = () => {
   const handleEditDelivery = (rule: ShippingRule) => {
     setEditingDeliveryRule(rule);
     setDeliveryForm({
-      keyword: rule.item_keyword,
+      cookie_id: rule.cookie_id || selectedAccount,
+      item_id: rule.item_id || '',
+      sku_id: rule.sku_id || '',
       card_id: String(rule.card_group_id),
       description: rule.name,
       enabled: rule.enabled
     });
+    if (rule.cookie_id && rule.item_id) {
+      loadDeliverySkus(rule.cookie_id, rule.item_id);
+    } else {
+      setDeliverySkus([]);
+    }
     setShowDeliveryModal(true);
   };
 
@@ -242,8 +304,12 @@ const Keywords: React.FC = () => {
   };
 
   const handleSaveDelivery = async () => {
-    if (!deliveryForm.keyword.trim()) {
-      alert('请填写触发关键词');
+    if (!deliveryForm.item_id) {
+      alert('请选择要绑定的闲鱼商品');
+      return;
+    }
+    if (Boolean(selectedDeliveryItem?.is_multi_spec) && !deliveryForm.sku_id) {
+      alert('多规格商品必须选择一个具体规格');
       return;
     }
     if (!deliveryForm.card_id) {
@@ -254,7 +320,10 @@ const Keywords: React.FC = () => {
     try {
       await updateShippingRule({
         id: editingDeliveryRule?.id,
-        item_keyword: deliveryForm.keyword,
+        item_keyword: selectedDeliveryItem?.item_title || deliveryForm.item_id,
+        cookie_id: deliveryForm.cookie_id,
+        item_id: deliveryForm.item_id,
+        sku_id: deliveryForm.sku_id,
         card_group_id: parseInt(deliveryForm.card_id),
         name: deliveryForm.description,
         priority: 1,
@@ -295,6 +364,9 @@ const Keywords: React.FC = () => {
       await updateShippingRule({
         id: rule.id,
         item_keyword: rule.item_keyword,
+        cookie_id: rule.cookie_id,
+        item_id: rule.item_id,
+        sku_id: rule.sku_id,
         card_group_id: rule.card_group_id,
         name: rule.name,
         priority: rule.priority,
@@ -386,7 +458,7 @@ const Keywords: React.FC = () => {
             <Truck className="w-6 h-6" />
             关键词发货
             {activeTab === 'delivery' && (
-              <span className="ml-2 px-3 py-1 bg-white/30 rounded-full text-sm">{shippingRules.length}</span>
+              <span className="ml-2 px-3 py-1 bg-white/30 rounded-full text-sm">{visibleShippingRules.length}</span>
             )}
           </button>
           <button
@@ -532,7 +604,7 @@ const Keywords: React.FC = () => {
       ) : activeTab === 'delivery' ? (
         // 关键词发货列表
         <div className="space-y-4">
-          {shippingRules.map((rule) => (
+          {visibleShippingRules.map((rule) => (
             <div
               key={rule.id}
               className={`group relative bg-gradient-to-br ${rule.enabled ? 'from-white to-blue-50/30' : 'from-gray-100 to-gray-150'} rounded-3xl p-6 shadow-lg hover:shadow-2xl transition-all duration-300 border-2 ${rule.enabled ? 'border-transparent hover:border-blue-400/30' : 'border-gray-200'} overflow-hidden`}
@@ -557,7 +629,9 @@ const Keywords: React.FC = () => {
                 {/* 内容 */}
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-3 mb-3">
-                    <h3 className="text-xl font-black text-gray-900">{rule.item_keyword}</h3>
+                    <h3 className="text-xl font-black text-gray-900">
+                      {rule.item_title || rule.item_keyword || '未命名规则'}
+                    </h3>
                     <span className={`px-3 py-1.5 rounded-xl text-xs font-bold shadow-md ${
                       rule.enabled
                         ? 'bg-gradient-to-r from-green-400 to-green-500 text-white'
@@ -568,11 +642,6 @@ const Keywords: React.FC = () => {
                   </div>
                   <p className="text-gray-600 bg-white/70 backdrop-blur-sm rounded-2xl px-4 py-3 shadow-inner border border-gray-100">
                     🎁 卡券：{rule.card_group_name || `ID: ${rule.card_group_id}`}
-                    {rule.is_multi_spec && rule.spec_name && rule.spec_value && (
-                      <span className="ml-2 inline-flex rounded-lg bg-blue-100 px-2 py-1 text-xs font-bold text-blue-700">
-                        规格：{rule.spec_name} / {rule.spec_value}
-                      </span>
-                    )}
                     {rule.name && (
                       <>
                         <span className="mx-2 text-gray-300">|</span>
@@ -581,20 +650,22 @@ const Keywords: React.FC = () => {
                     )}
                   </p>
                   <div className="mt-2 rounded-2xl border border-blue-100 bg-blue-50/70 px-4 py-3 text-sm text-gray-700">
-                    <span className="font-bold text-gray-900">当前匹配商品：</span>
-                    {getMatchedItems(rule.item_keyword).length > 0 ? (
-                      <span>
-                        {getMatchedItems(rule.item_keyword).map((item) => (
-                          <span key={`${item.cookie_id}-${item.item_id}`} className="ml-2 inline-block">
-                            {item.item_title || '未命名商品'}（ID: {item.item_id}）
-                          </span>
-                        ))}
-                        {getMatchedItems(rule.item_keyword).length > 1 && (
-                          <span className="ml-2 font-bold text-amber-600">匹配多个商品</span>
-                        )}
-                      </span>
+                    {rule.binding_mode === 'item' && rule.item_id ? (
+                      <>
+                        <span className="font-bold text-gray-900">绑定商品：</span>
+                        <span className="ml-2">
+                          {rule.item_title || '未命名商品'}（ID: {rule.item_id}）
+                        </span>
+                        <span className="mx-2 text-gray-300">|</span>
+                        <span className="font-bold text-gray-900">绑定规格：</span>
+                        <span className="ml-2">{rule.sku_display_name || '单规格商品'}</span>
+                      </>
                     ) : (
-                      <span className="ml-2 font-bold text-red-600">未匹配到已加载商品</span>
+                      <>
+                        <span className="font-bold text-amber-700">旧关键词规则：</span>
+                        <span className="ml-2">{rule.item_keyword}</span>
+                        <span className="ml-2 text-amber-600">编辑后可改为商品精确绑定</span>
+                      </>
                     )}
                   </div>
                 </div>
@@ -631,7 +702,7 @@ const Keywords: React.FC = () => {
             </div>
           ))}
 
-          {shippingRules.length === 0 && (
+          {visibleShippingRules.length === 0 && (
             <div className="py-24 text-center bg-gradient-to-br from-white to-gray-50 rounded-[2.5rem] border-3 border-dashed border-gray-300 shadow-xl">
               <div className="w-24 h-24 bg-gradient-to-br from-blue-400/20 to-blue-500/20 rounded-full flex items-center justify-center mx-auto mb-6 shadow-inner">
                 <Truck className="w-12 h-12 text-blue-400" />
@@ -847,25 +918,64 @@ const Keywords: React.FC = () => {
               <div>
                 <label className="flex items-center gap-2 text-sm font-black text-gray-900 mb-3">
                   <Key className="w-5 h-5 text-blue-500" />
-                  触发关键词
+                  绑定闲鱼商品
                 </label>
-                <input
-                  type="text"
-                  value={deliveryForm.keyword}
-                  onChange={(e) => setDeliveryForm({ ...deliveryForm, keyword: e.target.value })}
-                  placeholder="例如：发货卡密、自动发货"
+                <select
+                  value={deliveryForm.item_id}
+                  onChange={(e) => handleDeliveryItemChange(e.target.value)}
                   className="w-full px-6 py-4 rounded-2xl font-medium border-2 border-gray-200 focus:border-blue-400 focus:ring-4 focus:ring-blue-400/20 transition-all bg-gray-50"
-                />
-                <p className="text-sm text-gray-500 mt-2 ml-1">💡 商品标题中包含此关键词时匹配；多规格会继续按卡券规格精确筛选</p>
-                {deliveryForm.keyword.trim() && (
-                  <div className="mt-3 rounded-xl border border-blue-100 bg-blue-50 px-4 py-3 text-sm">
-                    <span className="font-bold">当前匹配：</span>
-                    {getMatchedItems(deliveryForm.keyword).length > 0
-                      ? getMatchedItems(deliveryForm.keyword).map((item) => `${item.item_title || '未命名商品'}（${item.item_id}）`).join('、')
-                      : '没有匹配到已加载商品'}
-                  </div>
-                )}
+                >
+                  <option value="">请选择商品</option>
+                  {accountItems.map((item) => (
+                    <option key={`${item.cookie_id}-${item.item_id}`} value={item.item_id}>
+                      {item.item_title || '未命名商品'}（{item.item_id}）
+                      {Boolean(item.is_multi_spec) ? ' [多规格]' : ''}
+                    </option>
+                  ))}
+                </select>
+                <p className="text-sm text-gray-500 mt-2 ml-1">
+                  商品列表来自当前闲鱼账号，付款后将按商品 ID 精确匹配
+                </p>
               </div>
+
+              {selectedDeliveryItem && Boolean(selectedDeliveryItem.is_multi_spec) && (
+                <div>
+                  <div className="mb-3 flex items-center justify-between gap-3">
+                    <label className="flex items-center gap-2 text-sm font-black text-gray-900">
+                      <Sparkles className="w-5 h-5 text-blue-500" />
+                      绑定商品规格
+                    </label>
+                    <button
+                      type="button"
+                      onClick={handleSyncDeliverySkus}
+                      disabled={skuLoading}
+                      className="rounded-xl bg-blue-50 px-3 py-2 text-xs font-bold text-blue-600 hover:bg-blue-100 disabled:opacity-50"
+                    >
+                      {skuLoading ? '同步中...' : '从闲鱼同步规格'}
+                    </button>
+                  </div>
+                  <select
+                    value={deliveryForm.sku_id}
+                    onChange={(e) => setDeliveryForm({ ...deliveryForm, sku_id: e.target.value })}
+                    disabled={skuLoading}
+                    className="w-full px-6 py-4 rounded-2xl font-medium border-2 border-gray-200 focus:border-blue-400 focus:ring-4 focus:ring-blue-400/20 transition-all bg-gray-50 disabled:opacity-50"
+                  >
+                    <option value="">请选择具体规格</option>
+                    {deliverySkus.map((sku) => (
+                      <option key={sku.sku_id} value={sku.sku_id}>
+                        {sku.display_name}
+                        {sku.price != null ? ` · ¥${sku.price.toFixed(2)}` : ''}
+                        {sku.quantity != null ? ` · 库存 ${sku.quantity}` : ''}
+                      </option>
+                    ))}
+                  </select>
+                  {!skuLoading && deliverySkus.length === 0 && (
+                    <p className="mt-2 text-sm font-bold text-amber-600">
+                      暂无规格快照，请点击“从闲鱼同步规格”
+                    </p>
+                  )}
+                </div>
+              )}
 
               <div>
                 <label className="flex items-center gap-2 text-sm font-black text-gray-900 mb-3">
@@ -885,7 +995,7 @@ const Keywords: React.FC = () => {
                     </option>
                   ))}
                 </select>
-                <p className="text-sm text-gray-500 mt-2 ml-1">🎁 规格绑定在“卡密库存”中设置，这里会显示规格名称和规格值</p>
+                <p className="text-sm text-gray-500 mt-2 ml-1">选择该商品或规格付款后需要发出的卡密/API 卡券</p>
               </div>
 
               <div>

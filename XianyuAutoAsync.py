@@ -4735,36 +4735,45 @@ class XianyuLive:
                     logger.error(f"获取订单规格信息失败: {self._safe_str(e)}，将跳过自动发货")
                     return None
 
-            # 智能匹配发货规则：多规格商品只匹配多规格卡券，非多规格商品只匹配非多规格卡券
+            # 新规则以账号 + 商品ID + SKU 为唯一事实来源。只要商品存在显式绑定，
+            # 即使规则被禁用或当前规格未配置，也绝不回退到标题关键词，避免发错卡密。
             delivery_rules = []
-
-            if is_multi_spec:
-                # 多规格商品：只匹配多规格发货规则
+            has_explicit_binding = db_manager.has_delivery_rule_bindings(self.cookie_id, item_id)
+            if has_explicit_binding:
+                delivery_rules = db_manager.get_delivery_rules_by_item(
+                    self.cookie_id, item_id, spec_name, spec_value
+                )
+                if delivery_rules:
+                    logger.info(
+                        f"✅ 商品精确匹配发货规则: item_id={item_id}, "
+                        f"spec={spec_name or '-'}:{spec_value or '-'}, count={len(delivery_rules)}"
+                    )
+                else:
+                    logger.warning(
+                        f"❌ 商品已配置显式发货规则，但当前规格未绑定或规则已禁用，"
+                        f"跳过自动发货: item_id={item_id}, spec={spec_name or '-'}:{spec_value or '-'}"
+                    )
+                    return None
+            elif is_multi_spec:
+                # 兼容旧规则：继续使用标题关键词 + 卡券规格匹配。
                 if spec_name and spec_value:
-                    logger.info(f"多规格商品，尝试匹配多规格发货规则: {search_text[:50]}... [{spec_name}:{spec_value}]")
-                    delivery_rules = db_manager.get_delivery_rules_by_keyword_and_spec(search_text, spec_name, spec_value)
-                    # 过滤只保留多规格卡券
+                    logger.info(f"旧多规格规则匹配: {search_text[:50]}... [{spec_name}:{spec_value}]")
+                    delivery_rules = db_manager.get_delivery_rules_by_keyword_and_spec(
+                        search_text, spec_name, spec_value
+                    )
                     delivery_rules = [r for r in delivery_rules if r.get('is_multi_spec')]
-                    
-                    if delivery_rules:
-                        logger.info(f"✅ 找到匹配的多规格发货规则: {len(delivery_rules)}个")
-                    else:
-                        logger.warning(f"❌ 多规格商品未找到匹配的多规格发货规则，跳过自动发货")
+                    if not delivery_rules:
+                        logger.warning("❌ 多规格商品未找到匹配的旧规则，跳过自动发货")
                         return None
                 else:
-                    logger.warning(f"❌ 多规格商品但无规格信息，跳过自动发货")
+                    logger.warning("❌ 多规格商品但无规格信息，跳过自动发货")
                     return None
             else:
-                # 非多规格商品：只匹配非多规格发货规则
-                logger.info(f"非多规格商品，尝试匹配普通发货规则: {search_text[:50]}...")
+                logger.info(f"旧普通规则匹配: {search_text[:50]}...")
                 delivery_rules = db_manager.get_delivery_rules_by_keyword(search_text)
-                # 过滤只保留非多规格卡券
                 delivery_rules = [r for r in delivery_rules if not r.get('is_multi_spec')]
-                
-                if delivery_rules:
-                    logger.info(f"✅ 找到匹配的普通发货规则: {len(delivery_rules)}个")
-                else:
-                    logger.warning(f"❌ 非多规格商品未找到匹配的普通发货规则，跳过自动发货")
+                if not delivery_rules:
+                    logger.warning("❌ 非多规格商品未找到匹配的旧规则，跳过自动发货")
                     return None
 
             # 检查匹配到的卡券数量，只有唯一匹配时才自动发货
@@ -4799,7 +4808,12 @@ class XianyuLive:
                 logger.warning(f"跳过保存商品信息：缺少商品标题 - {item_id}")
 
             # 详细的匹配结果日志
-            if rule.get('is_multi_spec'):
+            if rule.get('binding_mode') == 'item':
+                logger.info(
+                    f"🎯 商品绑定规则: item_id={rule.get('item_id')}, "
+                    f"sku={rule.get('sku_display_name') or '单规格'} -> {rule['card_name']}"
+                )
+            elif rule.get('is_multi_spec'):
                 if spec_name and spec_value:
                     logger.info(f"🎯 精确匹配多规格发货规则: {rule['keyword']} -> {rule['card_name']} [{rule['spec_name']}:{rule['spec_value']}]")
                     logger.info(f"📋 订单规格: {spec_name}:{spec_value} ✅ 匹配卡券规格: {rule['spec_name']}:{rule['spec_value']}")

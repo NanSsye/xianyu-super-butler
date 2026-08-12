@@ -268,6 +268,13 @@ export const getShippingRules = async (): Promise<ShippingRule[]> => {
         id: String(item.id),
         name: item.description || item.keyword || '',
         item_keyword: item.keyword || '',
+        cookie_id: item.cookie_id || '',
+        item_id: item.item_id || '',
+        item_title: item.item_title || '',
+        sku_id: item.sku_id || '',
+        sku_properties: Array.isArray(item.sku_properties) ? item.sku_properties : [],
+        sku_display_name: item.sku_display_name || '',
+        binding_mode: item.binding_mode || (item.item_id ? 'item' : 'legacy_keyword'),
         card_group_id: item.card_id || 0,
         card_group_name: item.card_name || '',
         card_type: item.card_type || '',
@@ -285,7 +292,10 @@ export const updateShippingRule = async (rule: Partial<ShippingRule>): Promise<a
         card_id: rule.card_group_id,
         delivery_count: rule.priority,
         enabled: rule.enabled ?? true,
-        description: rule.name
+        description: rule.name,
+        cookie_id: rule.cookie_id || '',
+        item_id: rule.item_id || '',
+        sku_id: rule.sku_id || ''
     };
     return rule.id ? put(`/delivery-rules/${rule.id}`, payload) : post('/delivery-rules', payload);
 }
