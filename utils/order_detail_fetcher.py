@@ -290,6 +290,20 @@ class OrderDetailFetcher:
                 url = f"https://www.goofish.com/order-detail?orderId={order_id}&role=seller"
                 logger.info(f"开始访问订单详情页面: {url}")
 
+                order_api_result = {}
+
+                async def capture_order_detail_response(api_response):
+                    if 'mtop.idle.web.trade.order.detail' not in api_response.url:
+                        return
+                    try:
+                        payload = await api_response.json()
+                        order_api_result.clear()
+                        order_api_result.update(self._parse_order_api_response(payload))
+                    except Exception as capture_error:
+                        logger.warning(f"解析订单详情API响应失败: {capture_error}")
+
+                self.page.on('response', capture_order_detail_response)
+
                 # 访问页面（带重试机制）
                 max_retries = 2
                 response = None
@@ -348,7 +362,20 @@ class OrderDetailFetcher:
                     await asyncio.sleep(3)
 
                 # 获取并解析SKU信息
-                sku_info = await self._get_sku_content()
+                if order_api_result.get('auth_error') == 'session_expired':
+                    logger.error(f"订单 {order_id} 网页Session已过期，停止DOM解析")
+                    return {
+                        'order_id': order_id,
+                        'url': url,
+                        'auth_error': 'session_expired',
+                        'error': '订单网页登录态已过期',
+                    }
+
+                sku_info = dict(order_api_result)
+                if not (sku_info.get('spec_name') and sku_info.get('spec_value')):
+                    dom_sku_info = await self._get_sku_content()
+                    for key, value in (dom_sku_info or {}).items():
+                        sku_info.setdefault(key, value)
 
                 # 获取页面标题
                 try:
@@ -428,6 +455,62 @@ class OrderDetailFetcher:
         except Exception as e:
             logger.error(f"解析SKU内容异常: {e}")
             return {}
+
+    @staticmethod
+    def _decode_json_values(value: Any) -> Any:
+        """Recursively decode JSON strings returned by MTOP valueType=string APIs."""
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped[:1] in ('{', '['):
+                try:
+                    return OrderDetailFetcher._decode_json_values(json.loads(stripped))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    return value
+            return value
+        if isinstance(value, dict):
+            return {key: OrderDetailFetcher._decode_json_values(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [OrderDetailFetcher._decode_json_values(item) for item in value]
+        return value
+
+    @staticmethod
+    def _find_first_key(value: Any, key: str) -> Any:
+        if isinstance(value, dict):
+            if key in value and value[key] not in (None, '', [], {}):
+                return value[key]
+            for item in value.values():
+                found = OrderDetailFetcher._find_first_key(item, key)
+                if found not in (None, '', [], {}):
+                    return found
+        elif isinstance(value, list):
+            for item in value:
+                found = OrderDetailFetcher._find_first_key(item, key)
+                if found not in (None, '', [], {}):
+                    return found
+        return None
+
+    def _parse_order_api_response(self, payload: Dict[str, Any]) -> Dict[str, str]:
+        """Extract stable order fields from the order-detail MTOP response."""
+        decoded = self._decode_json_values(payload or {})
+        ret = decoded.get('ret') if isinstance(decoded, dict) else None
+        ret_text = ' '.join(str(item) for item in (ret or []))
+        if 'SESSION_EXPIRED' in ret_text or 'Session过期' in ret_text:
+            return {'auth_error': 'session_expired'}
+
+        data = decoded.get('data', decoded) if isinstance(decoded, dict) else decoded
+        sku_text = self._find_first_key(data, 'skuInfo')
+        quantity = self._find_first_key(data, 'buyAmount')
+        amount = self._find_first_key(data, 'amount')
+        result = {}
+        if isinstance(sku_text, str):
+            result.update(self._parse_sku_content(sku_text.replace('：', ':')))
+        if quantity not in (None, ''):
+            result['quantity'] = str(quantity)
+        if isinstance(amount, dict):
+            amount = amount.get('value') or amount.get('text')
+        if amount not in (None, ''):
+            result['amount'] = str(amount)
+        return result
 
     async def _get_sku_content(self) -> Optional[Dict[str, str]]:
         """获取并解析SKU内容，包括规格、数量、金额、收货信息和订单时间"""

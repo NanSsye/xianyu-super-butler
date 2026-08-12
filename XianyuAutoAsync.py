@@ -4542,6 +4542,9 @@ class XianyuLive:
                 result = await fetch_order_detail_simple(order_id, cookie_string, headless=headless_mode)
 
                 if result:
+                    if result.get('auth_error') == 'session_expired':
+                        logger.error(f"【{self.cookie_id}】订单 {order_id} 网页Session已过期")
+                        return result
                     logger.info(f"【{self.cookie_id}】订单详情获取成功: {order_id}")
                     logger.info(f"【{self.cookie_id}】页面标题: {result.get('title', '未知')}")
 
@@ -4721,6 +4724,21 @@ class XianyuLive:
                     order_detail = await self.fetch_order_detail_info(order_id, item_id, send_user_id)
                     # 确保order_detail是字典类型
                     if order_detail and isinstance(order_detail, dict):
+                        if order_detail.get('auth_error') == 'session_expired':
+                            logger.error(
+                                f"订单 {order_id} 网页Session已过期，尝试通过已保存账号密码恢复登录"
+                            )
+                            refresh_success = await self._try_password_login_refresh(
+                                f"订单 {order_id} 网页Session过期"
+                            )
+                            if not refresh_success:
+                                await self.send_delivery_failure_notification(
+                                    "买家",
+                                    send_user_id or "未知",
+                                    item_id,
+                                    f"订单 {order_id} 网页登录态已过期，需要在账号管理完成验证后重试完整发货",
+                                )
+                            return None
                         spec_name = order_detail.get('spec_name', '')
                         spec_value = order_detail.get('spec_value', '')
                         if spec_name and spec_value:
