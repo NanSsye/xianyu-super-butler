@@ -2191,6 +2191,7 @@ async def check_password_login_status(
 @app.get("/password-login/verification-image/{session_id}")
 async def get_password_login_verification_image(
     session_id: str,
+    view: Optional[str] = Query(default=None),
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """仅向登录会话所属用户返回该会话登记的验证截图。"""
@@ -2209,6 +2210,17 @@ async def get_password_login_verification_image(
     if allowed_dir not in screenshot.parents or not screenshot.is_file():
         log_with_user('warning', f"拒绝读取登录会话验证截图: {session_id}", current_user)
         raise HTTPException(status_code=404, detail='验证截图不存在')
+
+    if view == 'qr':
+        from PIL import Image
+        with Image.open(screenshot) as image:
+            width, height = image.size
+            # 闲鱼登录弹窗的扫码区域位于右侧；保留少量标题和扫码提示，方便确认用途。
+            qr_panel = image.crop((int(width * 0.58), int(height * 0.05), width, int(height * 0.92)))
+            output = io.BytesIO()
+            qr_panel.save(output, format='PNG', optimize=True)
+            output.seek(0)
+        return StreamingResponse(output, media_type='image/png', headers={'Cache-Control': 'no-store'})
 
     return FileResponse(str(screenshot), media_type='image/jpeg', headers={'Cache-Control': 'no-store'})
 

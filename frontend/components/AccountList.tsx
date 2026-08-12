@@ -625,11 +625,23 @@ const AccountList: React.FC = () => {
                     {loginStatus.status === 'verification_required' && (
                       <div className="mt-4 space-y-3">
                         {(loginStatus.verification_image_url || loginStatus.qr_code_url) && (
-                          <img
-                            src={`${loginStatus.verification_image_url || loginStatus.qr_code_url}${loginStatus.verification_image_url ? `?v=${encodeURIComponent(loginSessionId)}` : ''}`}
-                            alt="闲鱼人工验证二维码"
-                            className="mx-auto max-h-80 max-w-full rounded-xl border bg-white object-contain p-2"
-                          />
+                          <div className="space-y-2 text-center">
+                            <img
+                              src={`${loginStatus.verification_image_url || loginStatus.qr_code_url}${loginStatus.verification_image_url ? `?view=qr&v=${encodeURIComponent(loginSessionId)}` : ''}`}
+                              alt="闲鱼人工验证二维码（放大）"
+                              className="mx-auto w-full max-w-sm rounded-xl border bg-white object-contain p-2 shadow-sm"
+                            />
+                            {loginStatus.verification_image_url && (
+                              <a
+                                href={`${loginStatus.verification_image_url}?v=${encodeURIComponent(loginSessionId)}`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="inline-block text-sm font-bold text-amber-800 underline"
+                              >
+                                查看完整原图和错误提示
+                              </a>
+                            )}
+                          </div>
                         )}
                         {loginStatus.verification_url && (
                           <a
