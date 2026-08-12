@@ -3730,10 +3730,33 @@ class XianyuSliderStealth:
                             check_interval = 10  # 每10秒检查一次
                             max_wait_time = 450  # 最多等待7.5分钟
                             waited_time = 0
+                            verification_completion_detected = False
                             
                             while waited_time < max_wait_time:
                                 time.sleep(check_interval)
                                 waited_time += check_interval
+
+                                # 手机端完成扫码/人脸验证后，验证 iframe 通常会关闭、隐藏或显示成功文案。
+                                # 原实现只检查聊天列表，不刷新父页面，因此会一直卡在“等待验证”。
+                                try:
+                                    verification_iframe = page.query_selector('iframe#alibaba-login-box')
+                                    iframe_finished = not verification_iframe or not verification_iframe.is_visible()
+                                    if not iframe_finished and verification_iframe:
+                                        verification_frame = verification_iframe.content_frame()
+                                        if verification_frame:
+                                            visible_text = ' '.join((verification_frame.locator('body').inner_text(timeout=2000) or '').split())
+                                            iframe_finished = any(
+                                                text in visible_text
+                                                for text in ('验证成功', '扫码成功', '登录成功', '验证已完成', '已确认')
+                                            )
+
+                                    if iframe_finished:
+                                        logger.info(f"【{self.pure_user_id}】检测到手机端验证已完成，刷新登录页确认状态...")
+                                        page.reload(wait_until='domcontentloaded', timeout=30000)
+                                        time.sleep(3)
+                                        verification_completion_detected = True
+                                except Exception as completion_error:
+                                    logger.debug(f"【{self.pure_user_id}】检测手机端验证完成状态时出错: {completion_error}")
                                 
                                 # 先检测是否有滑块，如果有就处理
                                 try:
@@ -3827,6 +3850,13 @@ class XianyuSliderStealth:
                                         logger.success(f"【{self.pure_user_id}】✅ 验证成功，登录状态已确认！")
                                         login_success = True
                                         break
+                                    elif verification_completion_detected:
+                                        # 已收到验证完成信号但聊天列表尚未渲染时，以有效登录 Cookie 作为确认依据。
+                                        current_cookies = {cookie.get('name'): cookie.get('value') for cookie in context.cookies()}
+                                        if current_cookies.get('unb') and current_cookies.get('cookie2'):
+                                            logger.success(f"【{self.pure_user_id}】✅ 验证完成并已取得有效登录 Cookie")
+                                            login_success = True
+                                            break
                                     else:
                                         logger.info(f"【{self.pure_user_id}】等待验证中... (已等待{waited_time}秒/{max_wait_time}秒)")
                                 except Exception as e:

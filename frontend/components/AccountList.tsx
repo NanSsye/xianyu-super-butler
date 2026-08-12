@@ -245,6 +245,7 @@ const AccountList: React.FC = () => {
           if (status.status === 'success') {
             stopLoginPolling();
             await loadAccounts();
+            window.setTimeout(() => setActiveModal(null), 1200);
             return false;
           } else if (['failed', 'error', 'not_found', 'forbidden'].includes(status.status)) {
             stopLoginPolling();
