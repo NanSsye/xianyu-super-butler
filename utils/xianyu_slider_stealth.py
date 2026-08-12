@@ -2565,13 +2565,21 @@ class XianyuSliderStealth:
         try:
             logger.debug(f"【{self.pure_user_id}】检查登录错误...")
             
-            # 检测账密错误
+            # 只接受可见错误容器中的明确文案。登录页源码里包含错误模板，
+            # 不能仅凭 HTML 出现“账密错误”就判定用户输入错误。
             error_selectors = [
                 '.login-error-msg',  # 主要的错误消息类
                 '[class*="error-msg"]',  # 包含error-msg的类
-                'div:has-text("账密错误")',  # 包含"账密错误"文本的div
-                'text=账密错误',  # 直接文本匹配
+                '.fm-error',
+                '[role="alert"]',
             ]
+            credential_error_messages = {
+                '账密错误',
+                '账号密码错误',
+                '用户名或密码错误',
+                '账号或密码错误',
+                '账户名或登录密码不正确',
+            }
             
             # 在主页面和所有frame中查找
             frames_to_check = [page] + page.frames
@@ -2582,20 +2590,12 @@ class XianyuSliderStealth:
                         try:
                             element = frame.query_selector(selector)
                             if element and element.is_visible():
-                                error_text = element.inner_text()
-                                logger.error(f"【{self.pure_user_id}】❌ 检测到登录错误: {error_text}")
-                                return True, error_text
+                                error_text = ' '.join((element.inner_text() or '').split())
+                                if error_text in credential_error_messages:
+                                    logger.error(f"【{self.pure_user_id}】❌ 检测到明确的账号或密码错误提示")
+                                    return True, error_text
                         except:
                             continue
-                            
-                    # 也检查页面HTML中是否包含错误文本
-                    try:
-                        content = frame.content()
-                        if '账密错误' in content or '账号密码错误' in content or '用户名或密码错误' in content:
-                            logger.error(f"【{self.pure_user_id}】❌ 页面内容中检测到账密错误")
-                            return True, "账密错误"
-                    except:
-                        pass
                         
                 except:
                     continue
@@ -3041,7 +3041,7 @@ class XianyuSliderStealth:
             
             browser_mode = "有头" if show_browser else "无头"
             logger.info(f"【{self.pure_user_id}】开始{browser_mode}模式密码登录流程（使用Playwright）...")
-            logger.info(f"【{self.pure_user_id}】账号: {account}")
+            logger.info(f"【{self.pure_user_id}】账号密码已提供，账号长度: {len(account)}")
             logger.info("=" * 60)
             
             # 启动浏览器（使用持久化上下文）

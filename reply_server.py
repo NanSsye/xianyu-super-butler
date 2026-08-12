@@ -1455,7 +1455,10 @@ def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)
             'enabled': cookie_enabled,
             'auto_confirm': auto_confirm,
             'remark': remark,
-            'pause_duration': cookie_details.get('pause_duration', 10) if cookie_details else 10
+            'pause_duration': cookie_details.get('pause_duration', 10) if cookie_details else 10,
+            'username': cookie_details.get('username', '') if cookie_details else '',
+            'has_login_password': bool(cookie_details.get('password')) if cookie_details else False,
+            'show_browser': cookie_details.get('show_browser', False) if cookie_details else False
         })
 
     return result
@@ -1838,8 +1841,11 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                 )
                 
                 if cookies_dict is None:
+                    if password_login_sessions[session_id].get('status') == 'verification_required':
+                        log_with_user('info', f"账号登录正在等待人工验证: {account_id}", current_user)
+                        return
                     password_login_sessions[session_id]['status'] = 'failed'
-                    password_login_sessions[session_id]['error'] = '登录失败，请检查账号密码是否正确'
+                    password_login_sessions[session_id]['error'] = '登录未完成，可能仍受闲鱼安全验证限制，请使用扫码登录或稍后重试'
                     log_with_user('error', f"账号密码登录失败: {account_id}", current_user)
                     return
                 
@@ -2015,26 +2021,43 @@ async def password_login(
     """账号密码登录接口（异步，支持人脸认证）"""
     try:
         account_id = request.get('account_id')
-        account = request.get('account')
-        password = request.get('password')
-        show_browser = request.get('show_browser', False)
+        account = (request.get('account') or '').strip()
+        password = request.get('password') or ''
+        show_browser = request.get('show_browser')
         
-        if not account_id or not account or not password:
-            return {'success': False, 'message': '账号ID、登录账号和密码不能为空'}
+        if not account_id:
+            return {'success': False, 'message': '账号ID不能为空'}
+
+        saved_login = db_manager.get_cookie_details(account_id)
+        if not saved_login or saved_login.get('user_id') != current_user['user_id']:
+            raise HTTPException(status_code=403, detail='无权限操作该账号')
+
+        account = account or saved_login.get('username', '')
+        password = password or saved_login.get('password', '')
+        if show_browser is None:
+            show_browser = saved_login.get('show_browser', False)
+
+        if not account or not password:
+            return {'success': False, 'message': '请先保存闲鱼手机号和登录密码'}
         
-        log_with_user('info', f"开始账号密码登录: {account_id}, 账号: {account}", current_user)
+        log_with_user('info', f"开始账号密码登录: {account_id}", current_user)
         
         # 生成会话ID
         import secrets
         session_id = secrets.token_urlsafe(16)
         
         user_id = current_user['user_id']
+
+        # 防止账号后台重连在人工登录期间再次并发启动密码登录。
+        try:
+            from XianyuAutoAsync import XianyuLive
+            XianyuLive._last_password_login_time[account_id] = time.time()
+        except Exception as cooldown_error:
+            log_with_user('warning', f"设置人工登录冷却期失败: {account_id}, 错误: {str(cooldown_error)}", current_user)
         
         # 创建登录会话
         password_login_sessions[session_id] = {
             'account_id': account_id,
-            'account': account,
-            'password': password,
             'show_browser': show_browser,
             'status': 'processing',
             'verification_url': None,

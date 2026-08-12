@@ -36,6 +36,7 @@ export const getAccountDetails = async (): Promise<AccountDetail[]> => {
     pause_duration: item.pause_duration,
     username: item.username || '',
     login_password: '',
+    has_login_password: Boolean(item.has_login_password),
     show_browser: item.show_browser,
     nickname: item.remark || `Account ${item.id.substring(0,6)}`,
     avatar_url: `https://api.dicebear.com/7.x/avataaars/svg?seed=${item.id}`,
@@ -61,8 +62,8 @@ export type PasswordLoginStatus = {
 
 export const startPasswordLogin = async (data: {
   account_id: string;
-  account: string;
-  password: string;
+  account?: string;
+  password?: string;
   show_browser?: boolean;
 }): Promise<{ success: boolean; session_id?: string; message?: string }> => {
   return post('/password-login', data);

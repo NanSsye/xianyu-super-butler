@@ -38,6 +38,7 @@ export interface AccountDetail {
   // 登录信息
   username?: string;
   login_password?: string;
+  has_login_password?: boolean;
   show_browser?: boolean;
   // Frontend helpers
   nickname?: string;

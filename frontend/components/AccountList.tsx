@@ -185,12 +185,12 @@ const AccountList: React.FC = () => {
       // 更新登录信息
       if (
         editForm.username !== (editingAccount.username || '') ||
-        editForm.login_password !== (editingAccount.login_password || '') ||
+        Boolean(editForm.login_password) ||
         editForm.show_browser !== (editingAccount.show_browser || false)
       ) {
         promises.push(updateAccountLoginInfo(editingAccount.id, {
           username: editForm.username,
-          login_password: editForm.login_password,
+          ...(editForm.login_password ? { login_password: editForm.login_password } : {}),
           show_browser: editForm.show_browser,
         }));
       }
@@ -208,8 +208,12 @@ const AccountList: React.FC = () => {
 
   const handlePasswordLogin = async () => {
     if (!editingAccount) return;
-    if (!editForm.username.trim() || !editForm.login_password) {
-      alert('请先填写闲鱼账号和登录密码');
+    if (!editForm.username.trim()) {
+      alert('请先填写并保存闲鱼手机号');
+      return;
+    }
+    if (!editForm.login_password && !editingAccount.has_login_password) {
+      alert('请先填写并保存闲鱼登录密码');
       return;
     }
 
@@ -219,13 +223,13 @@ const AccountList: React.FC = () => {
     try {
       await updateAccountLoginInfo(editingAccount.id, {
         username: editForm.username.trim(),
-        login_password: editForm.login_password,
+        ...(editForm.login_password ? { login_password: editForm.login_password } : {}),
         show_browser: editForm.show_browser,
       });
       const result = await startPasswordLogin({
         account_id: editingAccount.id,
-        account: editForm.username.trim(),
-        password: editForm.login_password,
+        ...(editForm.username.trim() !== (editingAccount.username || '') ? { account: editForm.username.trim() } : {}),
+        ...(editForm.login_password ? { password: editForm.login_password } : {}),
         show_browser: editForm.show_browser,
       });
       if (!result.success || !result.session_id) {
@@ -566,7 +570,7 @@ const AccountList: React.FC = () => {
                         type={editForm.showLoginPassword ? 'text' : 'password'}
                         value={editForm.login_password}
                         onChange={(e) => setEditForm({ ...editForm, login_password: e.target.value })}
-                        placeholder="用于自动登录"
+                        placeholder={editingAccount.has_login_password ? '密码已保存，留空表示不修改' : '用于自动登录'}
                         className="w-full ios-input px-4 py-3 rounded-xl pr-12"
                       />
                       <button
@@ -613,6 +617,9 @@ const AccountList: React.FC = () => {
                        loginStatus.status === 'processing' ? '正在登录' :
                        loginStatus.status === 'success' ? '登录成功，监听将自动恢复' : '登录失败'}
                     </div>
+                    <p className="text-xs text-gray-500 mt-1">
+                      {editingAccount.has_login_password ? '密码已保存在服务端，以后无需重复输入；填写新密码才会替换。' : '保存后密码仅由服务端用于闲鱼登录。'}
+                    </p>
                     {loginStatus.message && <p className="mt-1 text-sm text-gray-600">{loginStatus.message}</p>}
 
                     {loginStatus.status === 'verification_required' && (

@@ -2254,7 +2254,7 @@ class XianyuLive:
             from utils.xianyu_slider_stealth import XianyuSliderStealth
             browser_mode = "有头" if show_browser else "无头"
             logger.info(f"【{self.cookie_id}】开始使用{browser_mode}浏览器进行密码登录刷新Cookie...")
-            logger.info(f"【{self.cookie_id}】使用账号: {username}")
+            logger.info(f"【{self.cookie_id}】已读取登录账号，长度: {len(username)}")
             
             # 创建一个通知回调包装函数，支持接收截图路径和验证链接
             async def notification_callback_wrapper(message: str, screenshot_path: str = None, verification_url: str = None):
