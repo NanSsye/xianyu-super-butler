@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File, Form, Body, Query
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, StreamingResponse, FileResponse
 from fastapi import Response, Cookie
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -2101,7 +2101,7 @@ async def check_password_login_status(
             return {
                 'status': 'verification_required',
                 'verification_url': verification_url,
-                'screenshot_path': screenshot_path,
+                'verification_image_url': f'/password-login/verification-image/{session_id}' if screenshot_path else None,
                 'qr_code_url': session.get('qr_code_url'),  # 保留兼容性
                 'message': '需要人脸验证，请查看验证截图' if screenshot_path else '需要人脸验证，请点击验证链接'
             }
@@ -2163,6 +2163,31 @@ async def check_password_login_status(
     except Exception as e:
         log_with_user('error', f"检查账号密码登录状态异常: {str(e)}", current_user)
         return {'status': 'error', 'message': str(e)}
+
+
+@app.get("/password-login/verification-image/{session_id}")
+async def get_password_login_verification_image(
+    session_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """仅向登录会话所属用户返回该会话登记的验证截图。"""
+    session = password_login_sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail='会话不存在或已过期')
+    if session.get('user_id') != current_user['user_id']:
+        raise HTTPException(status_code=403, detail='无权限访问该会话')
+
+    screenshot_path = session.get('screenshot_path')
+    if session.get('status') != 'verification_required' or not screenshot_path:
+        raise HTTPException(status_code=404, detail='当前会话没有验证截图')
+
+    screenshot = Path(screenshot_path).resolve()
+    allowed_dir = Path(static_dir, 'uploads', 'images').resolve()
+    if allowed_dir not in screenshot.parents or not screenshot.is_file():
+        log_with_user('warning', f"拒绝读取登录会话验证截图: {session_id}", current_user)
+        raise HTTPException(status_code=404, detail='验证截图不存在')
+
+    return FileResponse(str(screenshot), media_type='image/jpeg', headers={'Cache-Control': 'no-store'})
 
 
 # ========================= 人脸验证截图相关接口 =========================

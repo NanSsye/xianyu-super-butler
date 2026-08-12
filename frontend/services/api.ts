@@ -51,6 +51,27 @@ export const checkQRLoginStatus = async (sessionId: string): Promise<any> => {
   return get(`/qr-login/check/${sessionId}`);
 };
 
+export type PasswordLoginStatus = {
+  status: 'processing' | 'verification_required' | 'success' | 'failed' | 'error' | 'not_found' | 'forbidden';
+  message?: string;
+  verification_url?: string;
+  verification_image_url?: string;
+  qr_code_url?: string;
+};
+
+export const startPasswordLogin = async (data: {
+  account_id: string;
+  account: string;
+  password: string;
+  show_browser?: boolean;
+}): Promise<{ success: boolean; session_id?: string; message?: string }> => {
+  return post('/password-login', data);
+};
+
+export const checkPasswordLoginStatus = async (sessionId: string): Promise<PasswordLoginStatus> => {
+  return get(`/password-login/check/${sessionId}`);
+};
+
 export const updateAccountStatus = async (id: string, enabled: boolean): Promise<any> => {
   return put(`/cookies/${id}/status`, { enabled });
 };

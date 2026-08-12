@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { AccountDetail, AIReplySettings } from '../types';
 import {
@@ -12,6 +12,9 @@ import {
   updateAccountPauseDuration,
   updateAccountCookie,
   updateAccountLoginInfo,
+  startPasswordLogin,
+  checkPasswordLoginStatus,
+  PasswordLoginStatus,
   updateAccountAISettings,
   getAllAISettings,
   getAccountAISettings
@@ -54,6 +57,18 @@ const AccountList: React.FC = () => {
     custom_prompts: '',
   });
   const [saving, setSaving] = useState(false);
+  const [loginSessionId, setLoginSessionId] = useState('');
+  const [loginStatus, setLoginStatus] = useState<PasswordLoginStatus | null>(null);
+  const loginPollRef = useRef<number | null>(null);
+
+  const stopLoginPolling = () => {
+    if (loginPollRef.current !== null) {
+      window.clearInterval(loginPollRef.current);
+      loginPollRef.current = null;
+    }
+  };
+
+  useEffect(() => () => stopLoginPolling(), []);
 
   const loadAccounts = async () => {
     setLoading(true);
@@ -103,6 +118,9 @@ const AccountList: React.FC = () => {
   };
 
   const openEditModal = (account: AccountDetail) => {
+    stopLoginPolling();
+    setLoginSessionId('');
+    setLoginStatus(null);
     setEditingAccount(account);
     setEditForm({
       remark: account.remark || account.note || '',
@@ -183,6 +201,63 @@ const AccountList: React.FC = () => {
     } catch (error) {
       console.error('更新账号失败:', error);
       alert('更新失败，请重试');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handlePasswordLogin = async () => {
+    if (!editingAccount) return;
+    if (!editForm.username.trim() || !editForm.login_password) {
+      alert('请先填写闲鱼账号和登录密码');
+      return;
+    }
+
+    setSaving(true);
+    stopLoginPolling();
+    setLoginStatus({ status: 'processing', message: '正在启动登录，请稍候…' });
+    try {
+      await updateAccountLoginInfo(editingAccount.id, {
+        username: editForm.username.trim(),
+        login_password: editForm.login_password,
+        show_browser: editForm.show_browser,
+      });
+      const result = await startPasswordLogin({
+        account_id: editingAccount.id,
+        account: editForm.username.trim(),
+        password: editForm.login_password,
+        show_browser: editForm.show_browser,
+      });
+      if (!result.success || !result.session_id) {
+        throw new Error(result.message || '登录任务启动失败');
+      }
+
+      const sessionId = result.session_id;
+      setLoginSessionId(sessionId);
+      const poll = async (): Promise<boolean> => {
+        try {
+          const status = await checkPasswordLoginStatus(sessionId);
+          setLoginStatus(status);
+          if (status.status === 'success') {
+            stopLoginPolling();
+            await loadAccounts();
+            return false;
+          } else if (['failed', 'error', 'not_found', 'forbidden'].includes(status.status)) {
+            stopLoginPolling();
+            return false;
+          }
+          return true;
+        } catch (error) {
+          stopLoginPolling();
+          setLoginStatus({ status: 'error', message: error instanceof Error ? error.message : '检查登录状态失败' });
+          return false;
+        }
+      };
+      if (await poll()) {
+        loginPollRef.current = window.setInterval(poll, 2000);
+      }
+    } catch (error) {
+      setLoginStatus({ status: 'error', message: error instanceof Error ? error.message : '登录失败' });
     } finally {
       setSaving(false);
     }
@@ -523,11 +598,59 @@ const AccountList: React.FC = () => {
                     </button>
                   </div>
                 </div>
+
+                {loginStatus && (
+                  <div className={`mt-5 rounded-2xl border p-4 ${
+                    loginStatus.status === 'success' ? 'border-green-200 bg-green-50' :
+                    ['failed', 'error', 'not_found', 'forbidden'].includes(loginStatus.status) ? 'border-red-200 bg-red-50' :
+                    loginStatus.status === 'verification_required' ? 'border-amber-300 bg-amber-50' :
+                    'border-blue-200 bg-blue-50'
+                  }`}>
+                    <div className="flex items-center gap-2 font-bold text-gray-900">
+                      {loginStatus.status === 'processing' && <Loader2 className="w-4 h-4 animate-spin" />}
+                      {loginStatus.status === 'success' && <Check className="w-4 h-4 text-green-600" />}
+                      {loginStatus.status === 'verification_required' ? '需要人工验证' :
+                       loginStatus.status === 'processing' ? '正在登录' :
+                       loginStatus.status === 'success' ? '登录成功，监听将自动恢复' : '登录失败'}
+                    </div>
+                    {loginStatus.message && <p className="mt-1 text-sm text-gray-600">{loginStatus.message}</p>}
+
+                    {loginStatus.status === 'verification_required' && (
+                      <div className="mt-4 space-y-3">
+                        {(loginStatus.verification_image_url || loginStatus.qr_code_url) && (
+                          <img
+                            src={`${loginStatus.verification_image_url || loginStatus.qr_code_url}${loginStatus.verification_image_url ? `?v=${encodeURIComponent(loginSessionId)}` : ''}`}
+                            alt="闲鱼人工验证二维码"
+                            className="mx-auto max-h-80 max-w-full rounded-xl border bg-white object-contain p-2"
+                          />
+                        )}
+                        {loginStatus.verification_url && (
+                          <a
+                            href={loginStatus.verification_url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="ios-btn-primary flex w-full items-center justify-center gap-2 rounded-xl px-4 py-3 font-bold"
+                          >
+                            <QrCode className="w-4 h-4" /> 打开闲鱼验证页面
+                          </a>
+                        )}
+                        <p className="text-xs text-amber-800">请用闲鱼 App 扫码或打开验证页面完成验证，本页会自动检查结果。</p>
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
             </div>
 
             <div className="modal-footer">
               <div className="flex gap-3 w-full">
+                <button
+                  onClick={handlePasswordLogin}
+                  className="flex-1 px-4 py-3 rounded-xl font-bold bg-amber-100 text-amber-900 hover:bg-amber-200 transition-colors flex items-center justify-center gap-2"
+                  disabled={saving}
+                >
+                  <Key className="w-4 h-4" /> 登录并验证
+                </button>
                 <button
                   onClick={() => setActiveModal(null)}
                   className="flex-1 px-6 py-3 rounded-xl font-bold bg-gray-100 text-gray-700 hover:bg-gray-200 transition-colors"
