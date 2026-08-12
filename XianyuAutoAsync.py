@@ -1421,6 +1421,10 @@ class XianyuLive:
         Args:
             captcha_retry_count: 滑块验证重试次数，用于防止无限递归
         """
+        from login_coordination import is_manual_login_active
+        if is_manual_login_active(self.cookie_id):
+            logger.info(f"【{self.cookie_id}】人工登录进行中，跳过后台Token刷新")
+            return None
         # 初始化通知发送标志，避免重复发送通知
         notification_sent = False
         
@@ -1838,6 +1842,10 @@ class XianyuLive:
     async def _handle_captcha_verification(self, res_json: dict) -> str:
         """处理滑块验证，返回新的cookies字符串"""
         try:
+            from login_coordination import is_manual_login_active
+            if is_manual_login_active(self.cookie_id):
+                logger.info(f"【{self.cookie_id}】人工登录进行中，后台不再并发处理滑块")
+                return None
             logger.info(f"【{self.cookie_id}】开始处理滑块验证...")
 
             # 获取验证URL
@@ -2201,6 +2209,11 @@ class XianyuLive:
         Returns:
             bool: 是否成功刷新Cookie
         """
+        from login_coordination import is_manual_login_active
+        if is_manual_login_active(self.cookie_id):
+            logger.info(f"【{self.cookie_id}】人工登录进行中，跳过后台密码登录刷新")
+            return False
+
         logger.warning(f"【{self.cookie_id}】检测到{trigger_reason}，准备刷新Cookie并重启实例...")
 
         # 检查是否在密码登录冷却期内，避免重复登录

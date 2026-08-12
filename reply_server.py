@@ -1681,6 +1681,7 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
             enable_learning=True,
             headless=not show_browser
         )
+        slider_instance.is_password_login = True
         
         # 更新会话信息
         password_login_sessions[session_id]['slider_instance'] = slider_instance
@@ -1993,6 +1994,11 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                 import traceback
                 logger.error(traceback.format_exc())
             finally:
+                try:
+                    from login_coordination import end_manual_login
+                    end_manual_login(account_id)
+                except Exception as coordination_error:
+                    log_with_user('warning', f"释放人工登录占用状态失败: {account_id}, 错误: {str(coordination_error)}", current_user)
                 # 清理实例（释放并发槽位）
                 try:
                     from utils.xianyu_slider_stealth import concurrency_manager
@@ -2051,6 +2057,10 @@ async def password_login(
         # 防止账号后台重连在人工登录期间再次并发启动密码登录。
         try:
             from XianyuAutoAsync import XianyuLive
+            from login_coordination import begin_manual_login, is_manual_login_active
+            if is_manual_login_active(account_id):
+                return {'success': False, 'message': '该账号已有登录任务正在进行，请等待当前任务完成'}
+            begin_manual_login(account_id)
             XianyuLive._last_password_login_time[account_id] = time.time()
         except Exception as cooldown_error:
             log_with_user('warning', f"设置人工登录冷却期失败: {account_id}, 错误: {str(cooldown_error)}", current_user)

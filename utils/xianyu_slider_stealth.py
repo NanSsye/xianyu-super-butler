@@ -2323,6 +2323,10 @@ class XianyuSliderStealth:
         
         for attempt in range(1, max_retries + 1):
             try:
+                from login_coordination import is_manual_login_active
+                if is_manual_login_active(self.pure_user_id) and not getattr(self, 'is_password_login', False):
+                    logger.info(f"【{self.pure_user_id}】人工登录已启动，取消后台滑块重试")
+                    return False
                 logger.info(f"【{self.pure_user_id}】开始处理滑块验证... (第{attempt}/{max_retries}次尝试)")
                 
                 # 如果不是第一次尝试，短暂等待后重试
@@ -2606,7 +2610,7 @@ class XianyuSliderStealth:
             logger.debug(f"【{self.pure_user_id}】检查登录错误时出错: {e}")
             return False, None
     
-    def _detect_qr_code_verification(self, page) -> tuple:
+    def _detect_qr_code_verification(self, page, handle_slider: bool = True) -> tuple:
         """检测是否存在二维码/人脸验证（排除滑块验证）
         
         Args:
@@ -2637,6 +2641,9 @@ class XianyuSliderStealth:
                         try:
                             element = frame.query_selector(selector)
                             if element and element.is_visible():
+                                if not handle_slider:
+                                    logger.info(f"【{self.pure_user_id}】人工验证流程已启动，忽略滑块并继续查找二维码入口")
+                                    continue
                                 logger.info(f"【{self.pure_user_id}】检测到滑块验证元素，立即处理滑块: {selector}")
                                 # 检测到滑块验证，记录是在哪个frame中找到的
                                 frame_info = "主页面" if frame == page else f"Frame: {frame.url if hasattr(frame, 'url') else '未知'}"
@@ -3598,7 +3605,7 @@ class XianyuSliderStealth:
                         logger.info(f"【{self.pure_user_id}】等待1秒后检测是否需要二维码/人脸验证...")
                         time.sleep(1)
                         logger.info(f"【{self.pure_user_id}】检测是否需要二维码/人脸验证...")
-                        has_qr, qr_frame = self._detect_qr_code_verification(page)
+                        has_qr, qr_frame = self._detect_qr_code_verification(page, handle_slider=False)
                         
                         # 如果检测到滑块并已处理，再次检查登录状态
                         if not has_qr:
@@ -3614,7 +3621,7 @@ class XianyuSliderStealth:
                                 logger.info(f"【{self.pure_user_id}】等待1秒后继续检测是否需要二维码/人脸验证...")
                                 time.sleep(1)
                                 logger.info(f"【{self.pure_user_id}】滑块验证后，继续检测是否需要二维码/人脸验证...")
-                                has_qr, qr_frame = self._detect_qr_code_verification(page)
+                                has_qr, qr_frame = self._detect_qr_code_verification(page, handle_slider=False)
                         
                         if has_qr:
                             logger.warning(f"【{self.pure_user_id}】⚠️ 检测到二维码/人脸验证")
@@ -3803,7 +3810,7 @@ class XianyuSliderStealth:
                                             pass
                                     
                                     # 如果检测到滑块，尝试处理
-                                    if slider_detected:
+                                    if slider_detected and not has_qr:
                                         logger.info(f"【{self.pure_user_id}】⚡ 检测到滑块，开始自动处理...")
                                         time.sleep(3)
                                         try:
